@@ -7,6 +7,16 @@ import torch
 from torchvision import models
 import torchvision
 
+import sys
+import os
+
+# 获取当前脚本所在目录
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# 获取 deform_conv_v2 所在目录（在上一级目录）
+parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
+# 添加到 Python 的搜索路径
+sys.path.append(parent_dir)
+
 from deform_conv_v2 import *
 
 
