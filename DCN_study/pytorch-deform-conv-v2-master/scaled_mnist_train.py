@@ -240,7 +240,7 @@ def main():
         ], index=['epoch', 'lr', 'loss', 'acc', 'val_loss', 'val_acc'])
 
         # ignore_index=True 确保 log 仍然是连续的行索引
-        log = log.pd.concat([log, tmp], ignore_index=True)
+        log = pd.concat([log, tmp], ignore_index=True)
         # 这行代码把 log 保存为 CSV 文件（log.csv）
         # index=False 表示不保存行索引，只存数据本身
         log.to_csv('models/%s/log.csv' % args.name, index=False)
