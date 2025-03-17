@@ -11,9 +11,9 @@
 
 ## DCN
 
-- [ ] train
-- [ ] predict
-- [ ] model
+- [x] train
+- [x] test
+- [x] model
 
 
 
