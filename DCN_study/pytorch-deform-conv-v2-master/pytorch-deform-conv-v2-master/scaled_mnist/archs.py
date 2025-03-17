@@ -9,6 +9,7 @@ import torchvision
 
 from deform_conv_v2 import *
 
+
 # 使用了 DCN v2 的神经网络模型
 class ScaledMNISTNet(nn.Module):
     def __init__(self, args, num_classes):
@@ -25,7 +26,7 @@ class ScaledMNISTNet(nn.Module):
         inplanes = 1  # 输入通道数，MNIST 数据集是灰度图，所以初始值为 1。
         outplanes = 32  # 第一个卷积层的输出通道数，初始为 32，之后每层翻倍。
         for i in range(4):
-            if args.deform and args.min_deform_layer <= i+1:
+            if args.deform and args.min_deform_layer <= i + 1:
                 features.append(DeformConv2d(inplanes, outplanes, 3, padding=1, bias=False, modulation=args.modulation))
             else:
                 features.append(nn.Conv2d(inplanes, outplanes, 3, padding=1, bias=False))
