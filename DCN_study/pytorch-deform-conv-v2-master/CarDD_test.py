@@ -58,7 +58,7 @@ num_classes = 5
 # 初始化模型
 model = archs.__dict__[args.arch](args, num_classes)
 # 加载权重
-model.load_state_dict(torch.load("models/%s/model.pth" % args.name, map_location=device))  # 加载权重
+model.load_state_dict(torch.load("/content/drive/MyDrive/models/%s/model.pth" % args.name, map_location=device))  # 加载权重
 model.to(device)
 model.eval()
 
@@ -127,15 +127,19 @@ print(report)
 def predict_image(image_path):
     image = Image.open(image_path)
     plt.imshow(image)
+    plt.axis("off")  # 关闭坐标轴
+    plt.show()
+
     image = transform(image).unsqueeze(0).to(device)  # 预处理并增加 batch 维度
 
     model.eval()
     with torch.no_grad():
-        output = torch.squeeze(model(image))
+        output = model(image).squeeze(0)  # 直接去掉 batch 维度
         predict = torch.softmax(output, dim=0)
-        predict_cla = torch.argmax(predict).numpy()
+        predict_cla = torch.argmax(predict, dim=0).item() + 1  # 先转为 Python int 避免 NumPy 相关问题
+        predict_prob = predict[predict_cla - 1].detach().cpu().item()  # 确保数值在 CPU 并转换为 Python float
 
-    print(f"预测类别: {str(predict_cla)}, 预测概率: {predict[predict_cla].numpy()}")
+    print(f"预测类别: {predict_cla}, 预测概率: {predict_prob:.4f}")
 
 
 # 测试单张图片预测（请替换路径）
