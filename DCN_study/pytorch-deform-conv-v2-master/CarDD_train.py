@@ -33,7 +33,7 @@ def parse_args():
                         help='use modulated deform conv')
     parser.add_argument('--min-deform-layer', default=3, type=int,
                         help='minimum number of layer using deform conv')
-    parser.add_argument('--epochs', default=10, type=int, metavar='N',
+    parser.add_argument('--epochs', default=24, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('--optimizer', default='SGD',
                         choices=['Adam', 'SGD'],
@@ -42,7 +42,7 @@ def parse_args():
                              ' (default: Adam)')
     parser.add_argument('--lr', '--learning-rate', default=1e-2, type=float,
                         metavar='LR', help='initial learning rate')
-    parser.add_argument('--momentum', default=0.5, type=float,
+    parser.add_argument('--momentum', default=0.9, type=float,
                         help='momentum')
     parser.add_argument('--weight-decay', default=1e-4, type=float,
                         help='weight decay')
@@ -183,18 +183,18 @@ def main():
     # 每次加载 32 个样本，随机打乱数据，并使用 8 个子进程加载数据
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=32,
+        batch_size=8,
         shuffle=True,
-        num_workers=4)
+        num_workers=2)
 
     # 创建验证集的数据集对象，并指定数据预处理方式
     validate_dataset = datasets.ImageFolder(root=image_path + "val", transform=data_transform["val"])
 
     val_loader = torch.utils.data.DataLoader(
         validate_dataset,
-        batch_size=32,
+        batch_size=8,
         shuffle=False,
-        num_workers=4)
+        num_workers=2)
 
     num_classes = 5
 

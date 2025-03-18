@@ -33,7 +33,7 @@ class ScaledMNISTNet(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
 
         features = []
-        inplanes = 1  # 输入通道数，MNIST 数据集是灰度图，所以初始值为 1。
+        inplanes = 3  # 输入通道数，若是 MNIST 数据集，是灰度图，初始值为 1。
         outplanes = 32  # 第一个卷积层的输出通道数，初始为 32，之后每层翻倍。
         # 一共四个卷积层，每个卷积层后面跟 BN 和 ReLU
         # DCN 出现在 args.min_deform_layer 及之后的层中
