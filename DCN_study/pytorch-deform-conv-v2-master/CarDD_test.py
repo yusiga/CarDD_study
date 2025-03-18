@@ -64,7 +64,7 @@ model.eval()
 
 # 预处理
 transform = transforms.Compose([
-    transforms.Resize((800, 1333)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize((0.5105, 0.4894, 0.4883), (0.2846, 0.2799, 0.2816))
 ])

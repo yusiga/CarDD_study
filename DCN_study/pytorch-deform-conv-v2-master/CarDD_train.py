@@ -162,13 +162,13 @@ def main():
 
     data_transform = {
         "train": transforms.Compose([  # 训练集的数据预处理方式
-            transforms.Resize((800, 1333)),
+            transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(),  # 随机水平翻转图像
             transforms.ToTensor(),  # 将图像转换为 Tensor
             transforms.Normalize((0.5105, 0.4894, 0.4883), (0.2846, 0.2799, 0.2816))  # 归一化
         ]),
         "val": transforms.Compose([  # 验证集的数据预处理方式
-            transforms.Resize((800, 1333)),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),  # 将图像转换为 Tensor
             transforms.Normalize((0.5105, 0.4894, 0.4883), (0.2846, 0.2799, 0.2816))  # 归一化
         ])
