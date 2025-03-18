@@ -162,17 +162,19 @@ def main():
 
     data_transform = {
         "train": transforms.Compose([  # 训练集的数据预处理方式
+            transforms.Resize((800, 1333)),
             transforms.RandomHorizontalFlip(),  # 随机水平翻转图像
             transforms.ToTensor(),  # 将图像转换为 Tensor
             transforms.Normalize((0.5105, 0.4894, 0.4883), (0.2846, 0.2799, 0.2816))  # 归一化
         ]),
         "val": transforms.Compose([  # 验证集的数据预处理方式
+            transforms.Resize((800, 1333)),
             transforms.ToTensor(),  # 将图像转换为 Tensor
             transforms.Normalize((0.5105, 0.4894, 0.4883), (0.2846, 0.2799, 0.2816))  # 归一化
         ])
     }
 
-    image_path = '/content/drive/MyDrive/sorted_data/'
+    image_path = '/content/drive/MyDrive/data_set/sorted_data/'
 
     # 创建训练集的数据集对象，并指定数据预处理方式
     train_dataset = datasets.ImageFolder(root=image_path + "train", transform=data_transform["train"])

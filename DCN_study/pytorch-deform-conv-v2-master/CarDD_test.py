@@ -64,12 +64,13 @@ model.eval()
 
 # 预处理
 transform = transforms.Compose([
+    transforms.Resize((800, 1333)),
     transforms.ToTensor(),
     transforms.Normalize((0.5105, 0.4894, 0.4883), (0.2846, 0.2799, 0.2816))
 ])
 
 # 载入测试集
-test_dataset = datasets.ImageFolder(root="/content/drive/MyDrive/sorted_data/test", transform=transform)
+test_dataset = datasets.ImageFolder(root="/content/drive/MyDrive/data_set/sorted_data/test", transform=transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 
 # 计算整体测试集准确率
@@ -138,4 +139,4 @@ def predict_image(image_path):
 
 
 # 测试单张图片预测（请替换路径）
-predict_image("/content/drive/MyDrive/sorted_data/test/1/000012.jpg")
+predict_image("/content/drive/MyDrive/data_set/sorted_data/test/1/000012.jpg")
