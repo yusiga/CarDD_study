@@ -6,12 +6,16 @@ import math
 from torch.autograd import Variable
 import numpy as np
 
+config_vgg = {'convert': [[128, 256, 512, 512, 512], [64, 128, 256, 512, 512]],
+              'deep_pool': [[512, 512, 256, 128], [512, 256, 128, 128], [True, True, True, False],
+                            [True, True, True, False]],
+              'score': 128}  # no convert layer, no conv6
 
+config_resnet = {'convert': [[64, 256, 512, 1024, 2048], [128, 256, 256, 512, 512]],
+                 'deep_pool': [[512, 512, 256, 256, 128], [512, 256, 256, 128, 128], [False, True, True, True, False],
+                               [True, True, True, True, False]],
+                 'score': 128}
 
-
-config_vgg = {'convert': [[128,256,512,512,512],[64,128,256,512,512]], 'deep_pool': [[512, 512, 256, 128], [512, 256, 128, 128], [True, True, True, False], [True, True, True, False]], 'score': 128}  # no convert layer, no conv6
-
-config_resnet = {'convert': [[64,256,512,1024,2048],[128,256,256,512,512]], 'deep_pool': [[512, 512, 256, 256, 128], [512, 256, 256, 128, 128], [False, True, True, True, False], [True, True, True, True, False]], 'score': 128}
 
 class ConvertLayer(nn.Module):
     def __init__(self, list_k):
@@ -27,9 +31,10 @@ class ConvertLayer(nn.Module):
             resl.append(self.convert0[i](list_x[i]))
         return resl
 
+
 class DeepPoolLayer_first(nn.Module):
     def __init__(self, k, k_out, need_x2,
-                 need_fuse):  # (config['deep_pool'][0][i], config['deep_pool'][1][i], config['deep_pool'][2][i], config['deep_pool'][3][i])
+                 need_fuse):
         super(DeepPoolLayer_first, self).__init__()
         self.pools_sizes = [2, 2, 2]
         self.need_x2 = need_x2
@@ -45,7 +50,7 @@ class DeepPoolLayer_first(nn.Module):
         if self.need_fuse:
             self.conv_sum_c = nn.Conv2d(k_out, k_out, 3, 1, 1, bias=False)
 
-    def forward(self, x, x2=None):  # (merge, conv2merge[k+1], infos[k])
+    def forward(self, x, x2=None):
         x_size = x.size()
         resl = x
         y = x
@@ -60,10 +65,11 @@ class DeepPoolLayer_first(nn.Module):
             resl = self.conv_sum_c(torch.add(resl, x2))
         return resl
 
+
 class ScoreLayer(nn.Module):
     def __init__(self, k):
         super(ScoreLayer, self).__init__()
-        self.score = nn.Conv2d(k ,1, 1, 1)
+        self.score = nn.Conv2d(k, 1, 1, 1)
 
     def forward(self, x, x_size=None):
         x = self.score(x)
@@ -71,12 +77,13 @@ class ScoreLayer(nn.Module):
             x = F.interpolate(x, x_size[2:], mode='bilinear', align_corners=True)
         return x
 
+
 def extra_layer(base_model_cfg, vgg):
     if base_model_cfg == 'vgg':
         config = config_vgg
     elif base_model_cfg == 'resnet':
         config = config_resnet
-    convert_layers, score_layers = [],[]
+    convert_layers, score_layers = [], []
     convert_layers = ConvertLayer(config['convert'])
 
     # for i in range(len(config['deep_pool'][0])):
@@ -93,12 +100,13 @@ class KRN_edge(nn.Module):
         self.base_model_cfg = base_model_cfg
         self.base = base  # 基本网络是一样的
 
-        #self.deep_pool = nn.ModuleList(deep_pool_layers)
+        # self.deep_pool = nn.ModuleList(deep_pool_layers)
         self.score = score_layers
         if self.base_model_cfg == 'resnet':
             self.convert = convert_layers
 
-        # 'deep_pool': [[512, 512, 256, 256, 128], [512, 256, 256, 128, 128], [False, True, True, True, False], [True, True, True, True, False]]
+        # 'deep_pool': [[512, 512, 256, 256, 128], [512, 256, 256, 128, 128],
+        #                   [False, True, True, True, False], [True, True, True, True, False]]
         self.DeepPool_solid1 = DeepPoolLayer_first(512, 512, False, True)
         self.DeepPool_solid2 = DeepPoolLayer_first(512, 256, True, True)
         self.DeepPool_solid3 = DeepPoolLayer_first(256, 256, True, True)
@@ -146,9 +154,10 @@ class KRN_edge(nn.Module):
         self.conv_add4 = nn.Conv2d(128, 32, 3, 1, 1, bias=False)
         self.conv_sum_out = nn.Conv2d(128, 128, 3, 1, 1, bias=False)
 
+    # 前向传播多了一个 ES
     def forward(self, x):
         x_size = x.size()
-        conv2merge, infos = self.base(x)  #
+        conv2merge, infos = self.base(x)
         if self.base_model_cfg == 'resnet':
             conv2merge = self.convert(conv2merge)
         conv2merge = conv2merge[::-1]
@@ -218,4 +227,3 @@ class KRN_edge(nn.Module):
         feasum_out = F.sigmoid(feasum_out)
 
         return feasum_out, merge_solid, out_merge_solid1, out_merge_contour1, out_merge_solid2, out_merge_contour2, out_merge_solid3, out_merge_contour3, out_merge_solid4, out_merge_contour4
-

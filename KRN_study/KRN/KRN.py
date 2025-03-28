@@ -144,14 +144,21 @@ class KRN(nn.Module):
         # 显著性图评估
         self.score_solid = ScoreLayer(128)
         self.score_contour = ScoreLayer(128)
+
         self.score_solid1 = ScoreLayer(512)
         self.score_contour1 = ScoreLayer(512)
+
         self.score_solid2 = ScoreLayer(256)
         self.score_contour2 = ScoreLayer(256)
+
         self.score_solid3 = ScoreLayer(256)
         self.score_contour3 = ScoreLayer(256)
+
         self.score_solid4 = ScoreLayer(128)
         self.score_contour4 = ScoreLayer(128)
+
+        self.score_solid = ScoreLayer(128)
+        self.score_contour = ScoreLayer(128)
         self.score_sum_out = ScoreLayer(128)
 
         self.conv_1 = nn.Conv2d(512, 512, 3, 1, 1, bias=False)
