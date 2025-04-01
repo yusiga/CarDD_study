@@ -1,7 +1,7 @@
 clc;
 clear;
 %path='C:\Users\Administrator\Desktop\mat-cvpr17_v1\ECSSD\';
-path='./PR_results/';
+path='D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\';
 dirpath=dir([path '*.mat']);
 method1 = cell(length(dirpath),3);
 

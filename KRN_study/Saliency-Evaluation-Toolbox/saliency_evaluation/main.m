@@ -27,11 +27,11 @@ clear; close all; clc;
 
 
 dataset = 'CarDD';
-model = 'CSNet';
-gtPath = 'E:\wangxinkuang\data\CarDD-SOD\CarDD\CarDD-TE\CarDD-TE-Mask';
-salPath = 'E:\wangxinkuang\result\CSNet';
-xlsxPath = ['E:\wangxinkuang\result\CarDD_v1_SOD\total\' model];
-csvPath = ['E:\wangxinkuang\result\CarDD_v1_SOD\total\' model];
+model = 'SAM2-UNet';
+gtPath = 'D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\CarDD-TE-Mask';
+salPath = 'D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\SAM2-UNet\test_mask';
+xlsxPath = ['D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\' model];
+csvPath = ['D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\' model];
 if ~isfolder(xlsxPath)
     mkdir(xlsxPath);
 end

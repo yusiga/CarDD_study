@@ -13,13 +13,15 @@ from networks.vgg import vgg16_locate
 
 config_vgg = {'convert': [[128, 256, 512, 512, 512], [64, 128, 256, 512, 512]],
               'deep_pool': [[512, 512, 256, 128], [512, 256, 128, 128], [True, True, True, False],
-                            [True, True, True, False]], 'score': 128}  # no convert layer, no conv6
+                            [True, True, True, False]],
+              'score': 128}  # no convert layer, no conv6
 
 config_resnet = {'convert': [[64, 256, 512, 1024, 2048], [128, 256, 256, 512, 512]],
                  'deep_pool': [[512, 512, 256, 256, 128], [512, 256, 256, 128, 128], [False, True, True, True, False],
-                               [True, True, True, True, False]], 'score': 128}
+                               [True, True, True, True, False]],
+                 'score': 128}
 
-save_path = r'/home/wangxinkuang/Files/research/code/KRN/results/'
+save_path = r'/data1_hdd/gyy/CarDD/cp/KRN/results/'
 
 
 class ConvertLayer(nn.Module):
@@ -367,7 +369,7 @@ class Solver(object):
 
         self.optimizer = Adam(filter(lambda p: p.requires_grad, self.net.parameters()), lr=self.lr,
                               weight_decay=self.wd)  # 优化器为 Adam
-        self.print_network(self.net, 'KRN_edge Structure')
+        # self.print_network(self.net, 'KRN_edge Structure')
 
     # 测试模型在测试集上的表现，并将预测的显著性图像 (saliency map) 保存为 PNG 格式。
     def test(self):
@@ -516,7 +518,7 @@ from dataset.dataset_edge_augment import get_loader
 
 
 # 返回测试集的图片路径和测试数据列表。
-def get_test_info(sal_mode='e', data_root='/workspace/wangxinkuang/data/saliency_detection/CarDD'):
+def get_test_info(sal_mode='e', data_root='/data1_ssd/gyy/CarDD/data/CarDD_SOD'):
     if sal_mode == 'e':
         image_root = data_root + '/data/ECSSD/Imgs/'
         image_source = data_root + './data/ECSSD/test.lst'
@@ -566,14 +568,14 @@ def main(config):
 
 
 if __name__ == '__main__':
-    root = r'/workspace/wangxinkuang'
+    root = r'/data1_ssd/gyy/CarDD/code/SOD/KRN'
     vgg_path = root + '/model/pretrained/vgg16_20M.pth'
     resnet_path = root + '/model/pretrained/resnet50_caffe.pth'
 
     parser = argparse.ArgumentParser()
 
     # Hyper-parameters
-    parser.add_argument('--device', type=int, default=0)
+    parser.add_argument('--device', type=int, default=3)
     parser.add_argument('--n_color', type=int, default=3)
     parser.add_argument('--lr', type=float, default=5e-5)  # Learning rate resnet:5e-5, vgg:1e-4
     parser.add_argument('--wd', type=float, default=0.0005)  # Weight decay
@@ -586,20 +588,20 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=1)  # only support 1 now
     parser.add_argument('--num_thread', type=int, default=1)
     parser.add_argument('--load', type=str, default='')
-    parser.add_argument('--save_folder', type=str, default='/workspace/wangxinkuang/model/saliency_detection/sgl_krn')
+    parser.add_argument('--save_folder', type=str, default='/data1_hdd/gyy/CarDD/cp/KRN')
     parser.add_argument('--epoch_save', type=int, default=3)
     parser.add_argument('--iter_size', type=int, default=10)
     parser.add_argument('--show_every', type=int, default=100)
 
-    parser.add_argument('--data_root', type=str, default='/workspace/wangxinkuang/data/saliency_detection/CarDD')
+    parser.add_argument('--data_root', type=str, default='/data1_ssd/gyy/CarDD/data/CarDD_SOD')
     # Train data
-    parser.add_argument('--train_root', type=str, default=root + '/data/CarDD/CarDD-TR')
-    parser.add_argument('--train_list', type=str, default=root + '/data/CarDD/CarDD-TR/train_pair.lst')
+    parser.add_argument('--train_root', type=str, default='/data1_ssd/gyy/CarDD/data/CarDD_SOD/CarDD-TR')
+    parser.add_argument('--train_list', type=str, default='/data1_ssd/gyy/CarDD/data/CarDD_SOD/CarDD-TR/train_pair.lst')
 
     # Testing settings
     parser.add_argument('--model', type=str, default=None)  # Snapshot
-    parser.add_argument('--test_model', type=str, default=None)  # Snapshot
-    parser.add_argument('--test_fold', type=str, default=None)  # Test results saving folder
+    parser.add_argument('--test_model', type=str, default='/data1_hdd/gyy/CarDD/cp/KRN/run-0/models/final.pth')  # Snapshot
+    parser.add_argument('--test_fold', type=str, default='/data1_hdd/gyy/CarDD/results/test_mask')  # Test results saving folder
     parser.add_argument('--sal_mode', type=str, default='e')  # Test image dataset
 
     # Misc
@@ -618,7 +620,13 @@ if __name__ == '__main__':
     # config.test_list = test_list
     config.test_root = config.data_root + '/CarDD-TE/CarDD-TE-Image/'
     config.test_list = config.data_root + '/CarDD-TE/test.lst'
-    device = config.device
-    torch.cuda.set_device(device)
+
+    device = torch.device(f'cuda:{config.device}' if torch.cuda.is_available() else 'cpu')
+    torch.cuda.set_device(config.device)
+
+    current_device = torch.cuda.current_device()
+    gpu_name = torch.cuda.get_device_name(current_device)
+    print(f"当前使用的 GPU ID: {current_device}")
+    print(f"当前使用的 GPU 名称: {gpu_name}")
 
     main(config)

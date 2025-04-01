@@ -14,6 +14,7 @@ if not os.path.exists(goal_path):
     os.makedirs(goal_path)
 goal_list = os.listdir(goal_path)
 
+# 判断尺寸是否匹配
 for file in os.listdir(source_path):
     # if file.endswith('_edge.png'):
     # copyfile(os.path.join(source_path, file), os.path.join(goal_path, file))
