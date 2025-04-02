@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from sam2.build_sam import build_sam2
 
 
+# 解码块
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
 
@@ -23,7 +24,8 @@ class DoubleConv(nn.Module):
     def forward(self, x):
         return self.double_conv(x)
     
-    
+
+# 处理高层的特征图，然后和低一层的特征图融合，喂给解码快处理，得出结果
 class Up(nn.Module):
     """Upscaling then double conv"""
 
@@ -48,6 +50,7 @@ class Up(nn.Module):
         return self.conv(x)
 
 
+# 适配器，在 Hiera Block 前，与 Hiera Block 一起构成 Encoder Block
 class Adapter(nn.Module):
     def __init__(self, blk) -> None:
         super(Adapter, self).__init__()
@@ -82,6 +85,7 @@ class BasicConv2d(nn.Module):
         return x
     
 
+# 感受野块，将提取的编码器特征减少通道数至 64，同时增强这些轻量级特征的表征能力。
 class RFB_modified(nn.Module):
     def __init__(self, in_channel, out_channel):
         super(RFB_modified, self).__init__()
@@ -149,14 +153,17 @@ class SAM2UNet(nn.Module):
         self.encoder.blocks = nn.Sequential(
             *blocks
         )
+        # 经过 RFB 后的输出
         self.rfb1 = RFB_modified(144, 64)
         self.rfb2 = RFB_modified(288, 64)
         self.rfb3 = RFB_modified(576, 64)
         self.rfb4 = RFB_modified(1152, 64)
+        # 解码器
         self.up1 = (Up(128, 64))
         self.up2 = (Up(128, 64))
         self.up3 = (Up(128, 64))
         self.up4 = (Up(128, 64))
+        # 生成分割结果
         self.side1 = nn.Conv2d(64, 1, kernel_size=1)
         self.side2 = nn.Conv2d(64, 1, kernel_size=1)
         self.head = nn.Conv2d(64, 1, kernel_size=1)
@@ -165,6 +172,7 @@ class SAM2UNet(nn.Module):
         x1, x2, x3, x4 = self.encoder(x)
         x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
         x = self.up1(x4, x3)
+        # 对三个分割结果进行上采样，并与真实掩码 G 进行监督训练
         out1 = F.interpolate(self.side1(x), scale_factor=16, mode='bilinear')
         x = self.up2(x, x2)
         out2 = F.interpolate(self.side2(x), scale_factor=8, mode='bilinear')
