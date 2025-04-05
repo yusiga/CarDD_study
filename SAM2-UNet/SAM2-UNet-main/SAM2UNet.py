@@ -25,7 +25,7 @@ class DoubleConv(nn.Module):
         return self.double_conv(x)
     
 
-# 处理高层的特征图，然后和低一层的特征图融合，喂给解码快处理，得出结果
+# 处理高层的特征图，然后和低一层的特征图融合，喂给解码块处理，得出结果
 class Up(nn.Module):
     """Upscaling then double conv"""
 
