@@ -208,6 +208,7 @@ def training(model, cfg) -> pipeline.ModelEma:
                 scaler.update()
                 optimizer.zero_grad(set_to_none=cfg.train.optimizer.set_to_none)
 
+                # 如果使用了模型指数移动平均（EMA），则更新 EMA 模型
                 if model_ema is not None:
                     model_ema.update(model)
             item_loss = loss.item()
@@ -238,6 +239,7 @@ def training(model, cfg) -> pipeline.ModelEma:
                 cfg.tb_logger.record_curve("avg_loss", loss_recorder.avg, curr_iter)
                 cfg.tb_logger.record_images(dict(**probs, **batch_data), curr_iter)
 
+            # 在训练的前三个 batch，将预测结果和数据可视化并保存为图像文件。
             if curr_iter < 3:  # plot some batches of the training phase
                 recorder.plot_results(
                     dict(**probs, **batch_data),

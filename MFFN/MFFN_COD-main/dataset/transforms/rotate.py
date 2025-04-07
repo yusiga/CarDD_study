@@ -13,13 +13,13 @@ class UniRotate(A.DualTransform):
         interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
             cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
             Default: cv2.INTER_LINEAR.
-        border_mode (OpenCV flag): flag that is used to specify the pixel extrapolation method. Should be one of:
+        border_mode (OpenCV flag): 边界填充方式。flag that is used to specify the pixel extrapolation method. Should be one of:
             cv2.BORDER_CONSTANT, cv2.BORDER_REPLICATE, cv2.BORDER_REFLECT, cv2.BORDER_WRAP, cv2.BORDER_REFLECT_101.
             Default: cv2.BORDER_REFLECT_101
-        value (int, float, list of ints, list of float): padding value if border_mode is cv2.BORDER_CONSTANT.
+        value (int, float, list of ints, list of float): 图像边界填充的数值。padding value if border_mode is cv2.BORDER_CONSTANT.
         mask_value (int, float,
                     list of ints,
-                    list of float): padding value if border_mode is cv2.BORDER_CONSTANT applied for masks.
+                    list of float): 掩码边界填充的数值。padding value if border_mode is cv2.BORDER_CONSTANT applied for masks.
         p (float): probability of applying the transform. Default: 0.5.
 
     Targets:
@@ -52,14 +52,18 @@ class UniRotate(A.DualTransform):
     def apply_to_mask(self, img, angle=0, interpolation=cv2.INTER_LINEAR, **params):
         return A.rotate(img, angle, interpolation, self.border_mode, self.mask_value)
 
+    # 随机参数生成器
+    # 从 limit 范围中随机采样一个角度，返回字典形式的参数
     def get_params(self):
         return {"angle": random.uniform(self.limit[0], self.limit[1])}
 
+    # 对边界框进行旋转，旋转中心在图像中心
     def apply_to_bbox(self, bbox, angle=0, **params):
         return A.bbox_rotate(bbox, angle, params["rows"], params["cols"])
 
     def apply_to_keypoint(self, keypoint, angle=0, **params):
         return A.keypoint_rotate(keypoint, angle, **params)
 
+    # 导出配置
     def get_transform_init_args_names(self):
         return ("limit", "interpolation", "border_mode", "value", "mask_value")

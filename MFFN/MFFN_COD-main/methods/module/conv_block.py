@@ -18,6 +18,7 @@ def _get_act_fn(act_name, inplace=True):
         raise NotImplementedError
 
 
+# BN 批归一化
 class ConvBNReLU(nn.Sequential):
     def __init__(
         self,
@@ -43,8 +44,8 @@ class ConvBNReLU(nn.Sequential):
         :param dilation:
         :param groups:
         :param bias:
-        :param act_name: None denote it doesn't use the activation layer.
-        :param is_transposed: True -> nn.ConvTranspose2d, False -> nn.Conv2d
+        :param act_name: None denote it doesn't use the activation layer. 激活函数
+        :param is_transposed: True -> nn.ConvTranspose2d, False -> nn.Conv2d. 反卷积和普通卷积
         """
         super().__init__()
         if is_transposed:
@@ -69,6 +70,7 @@ class ConvBNReLU(nn.Sequential):
             self.add_module(name=act_name, module=_get_act_fn(act_name=act_name))
 
 
+# GN 组归一化
 class ConvGNReLU(nn.Sequential):
     def __init__(
         self,

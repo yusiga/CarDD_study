@@ -19,22 +19,28 @@ class ASPP(nn.Module):
     def __init__(self, in_dim, out_dim):
         super(ASPP, self).__init__()
         self.conv1 = ConvBNReLU(in_dim, out_dim, kernel_size=1)
+        # 这几层分别用不同的膨胀率提取不同范围的上下文信息。
+        # dilation=2/5/7 表示 跳着采样，让卷积核看得更远，相当于变大了感受野。
         self.conv2 = ConvBNReLU(in_dim, out_dim, kernel_size=3, dilation=2, padding=2)
         self.conv3 = ConvBNReLU(in_dim, out_dim, kernel_size=3, dilation=5, padding=5)
         self.conv4 = ConvBNReLU(in_dim, out_dim, kernel_size=3, dilation=7, padding=7)
         self.conv5 = ConvBNReLU(in_dim, out_dim, kernel_size=1)
+        # 把 5 个分支的特征拼接起来，统一到一个通道维度上，作为输出。
         self.fuse = ConvBNReLU(5 * out_dim, out_dim, 3, 1, 1)
     def forward(self, x):
         conv1 = self.conv1(x)
         conv2 = self.conv2(x)
         conv3 = self.conv3(x)
         conv4 = self.conv4(x)
+        # 输入特征图的全局平均池化再还原尺寸，提取整张图像的全局上下文
         conv5 = self.conv5(cus_sample(x.mean((2, 3), keepdim=True), mode="size", factors=x.size()[2:]))
+        # 拼接融合
         return self.fuse(torch.cat((conv1, conv2, conv3, conv4, conv5), 1))
 
 class TransLayer(nn.Module):
     def __init__(self, out_c, last_module=ASPP):
         super().__init__()
+        # 对 c5（最深层的特征）用 ASPP 提取多尺度上下文。
         self.c5_down = nn.Sequential(
             # ConvBNReLU(2048, 256, 3, 1, 1),
             last_module(in_dim=2048, out_dim=out_c),
@@ -53,6 +59,7 @@ class TransLayer(nn.Module):
         c3 = self.c3_down(c3)
         c2 = self.c2_down(c2)
         c1 = self.c1_down(c1)
+        # H，W 从小到大
         return c5, c4, c3, c2, c1
     
 ###############  Cross-View Attention Module  ##################
@@ -120,6 +127,9 @@ class CAMV(nn.Module):
             ConvBNReLU(in_dim, in_dim, 3, 1, 1),
         )
         self.mm_size = mm_size
+        # 初始化可学习参数
+        # 通道权重参数
+        # 空间维度权重参数
         self.coe_c_c1 = nn.Parameter(data=torch.Tensor(1,64), requires_grad=True)
         self.coe_h_c1 = nn.Parameter(data=torch.Tensor(mm_size,mm_size), requires_grad=True)
         self.coe_w_c1 = nn.Parameter(data=torch.Tensor(mm_size,mm_size), requires_grad=True)
@@ -131,7 +141,8 @@ class CAMV(nn.Module):
         self.coe_c_c2 = nn.Parameter(data=torch.Tensor(1,64), requires_grad=True)
         self.coe_h_c2 = nn.Parameter(data=torch.Tensor(mm_size,mm_size), requires_grad=True)
         self.coe_w_c2 = nn.Parameter(data=torch.Tensor(mm_size,mm_size), requires_grad=True)
-        
+
+        # 使用均匀分布初始化这些权重参数的值，区间在 [-0.5, 0.5]。
         self.coe_c_c1.data.uniform_(-0.5,0.5)
         self.coe_h_c1.data.uniform_(-0.5,0.5)
         self.coe_w_c1.data.uniform_(-0.5,0.5)
@@ -221,6 +232,7 @@ class CAMV(nn.Module):
         ama = ama.mul(self.spatial_attn(ama))
         lms = self.fuse(torch.cat([ama,cmc],dim=1))
         return lms
+
 class Progressive_Iteration(nn.Module):
     def __init__(self, input_channels):
         super(Progressive_Iteration, self).__init__()
@@ -292,28 +304,38 @@ class CFU(nn.Module):
     def __init__(self, in_c, num_groups=4, hidden_dim=None):
         super().__init__()
         self.num_groups = num_groups
-        hidden_dim = hidden_dim or in_c // 2
-        expand_dim = hidden_dim * num_groups
+        hidden_dim = hidden_dim or in_c // 2  # 设置默认的hidden_dim为输入通道数的一半
+        expand_dim = hidden_dim * num_groups  # 扩展的通道数
+        # 使用 1x1 卷积，扩展输入通道数至较大的维度
         self.expand_conv = ConvBNReLU(in_c, expand_dim, 1)
+        # 创建用于交互操作的模块字典
         self.interact = nn.ModuleDict()
+        # 为每个分支创建卷积层
         self.interact["0"] = ConvBNReLU(hidden_dim, 2 * hidden_dim, 3, 1, 1)
         for group_id in range(1, num_groups - 1):
             self.interact[str(group_id)] = ConvBNReLU(2 * hidden_dim, 2 * hidden_dim, 3, 1, 1)
         self.interact[str(num_groups - 1)] = ConvBNReLU(2 * hidden_dim, 1 * hidden_dim, 3, 1, 1)
+        # 融合所有分支的输出
         self.fuse = nn.Sequential(nn.Conv2d(num_groups * hidden_dim, in_c, 3, 1, 1), nn.BatchNorm2d(in_c))
+        # 最后的 ReLU 激活
         self.final_relu = nn.ReLU(True)
+        # 引入一个 逐步迭代 的处理模块
         self.fp = Progressive_Iteration(192)
 
     def forward(self, x):
+        # chunk 操作会将扩展后的特征图沿通道维度（dim=1）分割成 num_groups 个部分
         xs = self.expand_conv(x).chunk(self.num_groups, dim=1)
         outs = []
+        # 第一个分支
         branch_out = self.interact["0"](xs[0])
         outs.append(branch_out.chunk(2, dim=1))
 
+        # 中间分支
         for group_id in range(1, self.num_groups - 1):
             branch_out = self.interact[str(group_id)](torch.cat([xs[group_id], outs[group_id - 1][1]], dim=1))
             outs.append(branch_out.chunk(2, dim=1))
 
+        # 最后一个分支
         group_id = self.num_groups - 1
         branch_out = self.interact[str(group_id)](torch.cat([xs[group_id], outs[group_id - 1][1]], dim=1))
         outs.append(branch_out.chunk(1, dim=1))
@@ -361,11 +383,11 @@ class MFFN(BasicModelClass):
         dim = [64, 64, 64, 64, 64]
         size = [12, 24, 48, 96, 192]
         self.CAMV_layers = nn.ModuleList([CAMV(in_dim=in_c, mm_size=mm_s) for in_c, mm_s in zip(dim, size)])
-        self.d5 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
-        self.d4 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
-        self.d3 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
-        self.d2 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
-        self.d1 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.d5 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
+        self.d4 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
+        self.d3 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
+        self.d2 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
+        self.d1 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
         self.out_layer_00 = ConvBNReLU(64, 32, 3, 1, 1)
         self.out_layer_01 = nn.Conv2d(32, 1, 1)
 
@@ -380,7 +402,7 @@ class MFFN(BasicModelClass):
         a1_trans_feats = self.encoder_translayer(a1_scale)
         a2_trans_feats = self.encoder_translayer(a2_scale)
         feats = []
-        for c1, o,c2,a1,a2, layer in zip(c1_trans_feats, o_trans_feats, c2_trans_feats, a1_trans_feats, a2_trans_feats, self.CAMV_layers):
+        for c1,o,c2,a1,a2, layer in zip(c1_trans_feats, o_trans_feats, c2_trans_feats, a1_trans_feats, a2_trans_feats, self.CAMV_layers):
             CAMV_outs = layer(c1=c1, o=o, c2=c2, a1=a1, a2=a2)
             feats.append(CAMV_outs)
 
@@ -438,13 +460,17 @@ class MFFN(BasicModelClass):
             loss_str.append(f"{name}_UAL_{ual_coef:.5f}: {ual_loss.item():.5f}")
         return sum(losses), " ".join(loss_str)
 
+    # 将模型的参数按特定规则进行分组，并返回一个字典
     def get_grouped_params(self):
         param_groups = {}
         for name, param in self.named_parameters():
+            # 预训练的参数
             if name.startswith("shared_encoder.layer"):
                 param_groups.setdefault("pretrained", []).append(param)
+            # 固定的参数（即这些参数不需要训练）
             elif name.startswith("shared_encoder."):
                 param_groups.setdefault("fixed", []).append(param)
+            # 重新训练的参数
             else:
                 param_groups.setdefault("retrained", []).append(param)
         return param_groups

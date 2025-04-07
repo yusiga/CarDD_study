@@ -11,7 +11,7 @@ def Multi_view_Data(image_path,mask_path,h0,w0,rh1,rh2):
     # Generate different angle views
     image_a1 = cv2.flip(image, 0, dst=None)   # Vertical   Mirror Flip
     image_a2 = cv2.flip(image, 1, dst=None)   # Horizontal Mirror Flip
-    image_a3 = cv2.flip(image, 1, dst=None)   # Diagonal   Mirror Flip
+    image_a3 = cv2.flip(image, -1, dst=None)   # Diagonal   Mirror Flip
     # Generate different perspective views
     p1 = np.float32([src_p1,src_p2,src_p3])   # Points of the original image
     p2 = np.float32([dst_p1,dst_p2,dst_p3])   # Points of the target   image

@@ -12,6 +12,7 @@ from utils.io.genaral import get_datasets_info_with_keys
 from utils.io.image import read_color_array, read_gray_array
 from PIL import Image
 
+# 在注册表中注册数据库
 @DATASETS.register(name="MFFN_cod_te")
 class MFFN_COD_TestDataset(_BaseSODDataset):
     def __init__(self, root: Tuple[str, dict], shape: Dict[str, int], interp_cfg: Dict = None):
@@ -26,9 +27,10 @@ class MFFN_COD_TestDataset(_BaseSODDataset):
         mask_path = self.total_mask_paths[index]
 
         image = read_color_array(image_path)
-        image0 = cv2.flip(image, 0, dst=None)   # 作水平镜像翻转
-        image1 = cv2.flip(image, -1, dst=None)  # 作垂直镜像翻转
+        image0 = cv2.flip(image, 0, dst=None)  # 垂直翻转
+        image1 = cv2.flip(image, -1, dst=None)  # 对角翻转
 
+        # 归一化处理
         image = self.image_norm(image=image)["image"]
         image0 = self.image_norm(image=image0)["image"]
         image1 = self.image_norm(image=image1)["image"]
@@ -37,13 +39,14 @@ class MFFN_COD_TestDataset(_BaseSODDataset):
         base_w = self.base_shape["w"]
         image0 = ss_resize(image0, scale=1.0, base_h=base_h, base_w=base_w)
         image1 = ss_resize(image1, scale=1.0, base_h=base_h, base_w=base_w)
-        images = ms_resize(image, scales=(2.0, 1.0, 1.8), base_h=base_h, base_w=base_w)
+        images = ms_resize(image, scales=(2.0, 1.0, 1.5), base_h=base_h, base_w=base_w)
         image_c_1 = torch.from_numpy(images[0]).permute(2, 0, 1)
         image_o = torch.from_numpy(images[1]).permute(2, 0, 1)
         image_c_2 = torch.from_numpy(images[2]).permute(2, 0, 1)
         image_a_1 = torch.from_numpy(image0).permute(2, 0, 1)
         image_a_2 = torch.from_numpy(image1).permute(2, 0, 1)
 
+        # mask 用于可视化或评估
         return dict(
             data={
                 "image_c1": image_c_1,
@@ -68,6 +71,10 @@ class MFFN_COD_TrainDataset(_BaseSODDataset):
         self.datasets = get_datasets_info_with_keys(dataset_infos=root, extra_keys=["mask"])
         self.total_image_paths = self.datasets["image"]
         self.total_mask_paths = self.datasets["mask"]
+        # 定义图像与 mask 联合进行的变换（数据增强），确保图像和 mask 保持对齐。
+        # 随机水平翻转；
+        # 随机旋转（UniRotate）；
+        # 图像归一化。
         self.joint_trans = A.Compose(
             [
                 A.HorizontalFlip(p=0.5),
@@ -80,8 +87,8 @@ class MFFN_COD_TrainDataset(_BaseSODDataset):
         image_path = self.total_image_paths[index]
         mask_path = self.total_mask_paths[index]
         image = read_color_array(image_path)
-        image0 = cv2.flip(image, 0, dst=None)  # 作水平镜像翻转
-        image1 = cv2.flip(image, -1, dst=None)  # 作垂直镜像翻转
+        image0 = cv2.flip(image, 0, dst=None)  # 垂直翻转
+        image1 = cv2.flip(image, -1, dst=None)  # 对角翻转
         mask = read_gray_array(mask_path, to_normalize=True, thr=0.5)
         transformed = self.joint_trans(image=image, mask=mask)
         transformed0 = self.joint_trans(image=image0, mask=mask)
@@ -89,12 +96,12 @@ class MFFN_COD_TrainDataset(_BaseSODDataset):
         image = transformed["image"]
         image0 = transformed0["image"]
         image1 = transformed1["image"]
-        # image0 = cv2.flip(image, 0, dst=None)  # 作水平镜像翻转
-        # image1 = cv2.flip(image, -1, dst=None)  # 作垂直镜像翻转
+        # image0 = cv2.flip(image, 0, dst=None)  # 垂直翻转
+        # image1 = cv2.flip(image, -1, dst=None)  # 对角翻转
         mask = transformed["mask"]
         base_h = self.base_shape["h"]
         base_w = self.base_shape["w"]
-        images = ms_resize(image, scales=(2.0, 1.0, 1.8), base_h=base_h, base_w=base_w)
+        images = ms_resize(image, scales=(2.0, 1.0, 1.5), base_h=base_h, base_w=base_w)
         image0 = ss_resize(image0, scale=1.0, base_h=base_h, base_w=base_w)
         image1 = ss_resize(image1, scale=1.0, base_h=base_h, base_w=base_w)
 

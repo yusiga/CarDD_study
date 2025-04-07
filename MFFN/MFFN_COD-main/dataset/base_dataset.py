@@ -21,6 +21,7 @@ class _BaseSODDataset(Dataset):
         """
         super().__init__()
         self.base_shape = base_shape
+        # 如果 extra_scales 不为 None，则必须提供 interp_cfg，否则抛出 ValueError
         if extra_scales is not None and interp_cfg is None:
             raise ValueError("interp_cfg must be True Value when extra_scales is not None.")
         self.extra_scales = extra_scales
@@ -38,12 +39,13 @@ class _BaseSODDataset(Dataset):
 
         if not interp_cfg:  # None or {}
             interp_cfg = {}
-            self._combine_func = torch.stack
+            self._combine_func = torch.stack  # 数据通过 torch.stack 组合。
         else:
+            # 否则启用多尺度训练策略，并使用 torch.cat 组合数据。
             print(f"Using multi-scale training strategy with extra scales: {self._sizes}")
             self._combine_func = torch.cat
         self._interp_cfg = interp_cfg
-        self._default_cfg = dict(interpolation="bilinear", align_corners=False)
+        self._default_cfg = dict(interpolation="bilinear", align_corners=False)  # 默认的插值配置为双线性插值
 
     def _collate(self, batch, parent_key=None):
         """
@@ -57,6 +59,9 @@ class _BaseSODDataset(Dataset):
                 interp_cfg = self._default_cfg
             else:
                 interp_cfg["factors"] = self._default_cfg["factors"]
+            # 进行插值处理
+            # unsqueeze 插入
+            # squeeze 删除
             batch = [cus_sample(it.unsqueeze(0), mode="size", **interp_cfg) for it in batch]
             out = None
             if torch.utils.data.get_worker_info() is not None:
@@ -65,6 +70,7 @@ class _BaseSODDataset(Dataset):
                 numel = sum([x.numel() for x in batch])
                 storage = elem.storage()._new_shared(numel)
                 out = elem.new(storage)
+            # 使用 _combine_func（torch.stack 或 torch.cat）将处理后的批次数据沿第 0 维合并。
             return self._combine_func(batch, dim=0, out=out)
         elif isinstance(elem, float):
             return torch.tensor(batch, dtype=torch.float64)
@@ -72,6 +78,7 @@ class _BaseSODDataset(Dataset):
             return torch.tensor(batch)
         elif isinstance(elem, (str, bytes)):
             return batch
+        # mapping：例如图像和标签
         elif isinstance(elem, abc.Mapping):
             return {key: self._collate([d[key] for d in batch], parent_key=key) for key in elem}
         elif isinstance(elem, tuple) and hasattr(elem, "_fields"):  # namedtuple
@@ -87,6 +94,9 @@ class _BaseSODDataset(Dataset):
 
         raise TypeError("collate_fn: batch must contain tensors, numbers, dicts or lists; found {}".format(elem_type))
 
+    # 将样本列表 batch 合并成一个批次。
+    # 如果提供了插值配置，则随机选择一个尺度并调用 _collate 方法，进行自定义的批次组合。
+    # 如果没有插值配置，直接调用 PyTorch 的默认 collate 函数。
     def collate_fn(self, batch):
         if self._interp_cfg:
             self._default_cfg["factors"] = random.choice(self._sizes)

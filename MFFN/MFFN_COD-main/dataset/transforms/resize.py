@@ -24,7 +24,7 @@ class UniResize(A.DualTransform):
         super(UniResize, self).__init__(always_apply, p)
         self.height = height
         self.width = width
-        self.interpolation = interpolation
+        self.interpolation = interpolation  # 插值方式（如线性、最邻近、立方等）
 
     def apply(self, img, interpolation=cv2.INTER_LINEAR, **params):
         return A.resize(img, height=self.height, width=self.width, interpolation=interpolation)
@@ -39,15 +39,21 @@ class UniResize(A.DualTransform):
     def apply_to_keypoint(self, keypoint, **params):
         height = params["rows"]
         width = params["cols"]
+        # 对关键点坐标进行线性缩放，保持相对位置一致
         scale_x = self.width / width
         scale_y = self.height / height
         return A.keypoint_scale(keypoint, scale_x, scale_y)
 
+    # 导出配置
     def get_transform_init_args_names(self):
         return ("height", "width", "interpolation")
 
 
+# 多尺度缩放函数
+# 输入：图像 img，多个缩放比例 scales（如 [0.5, 1.0, 1.5]），可选的基准高度宽度
+# 输出：多个不同尺寸缩放后的图像列表
 def ms_resize(img, scales, base_h=None, base_w=None, interpolation=cv2.INTER_LINEAR):
+    # 确保输入的是多个尺度
     assert isinstance(scales, (list, tuple))
     if base_h is None and base_w is None:
         h = img.shape[0]
@@ -58,6 +64,7 @@ def ms_resize(img, scales, base_h=None, base_w=None, interpolation=cv2.INTER_LIN
     return [A.resize(img, height=int(h * s), width=int(w * s), interpolation=interpolation) for s in scales]
 
 
+# 单尺度缩放函数
 def ss_resize(img, scale, base_h=None, base_w=None, interpolation=cv2.INTER_LINEAR):
     if base_h is None and base_w is None:
         h = img.shape[0]

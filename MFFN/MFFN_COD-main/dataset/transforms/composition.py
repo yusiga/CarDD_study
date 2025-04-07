@@ -114,6 +114,7 @@ class Compose(BaseCompose):
         )
         return dictionary
 
+    # 数据有效性检查
     def _check_args(self, **kwargs):
         checked_single = ["image", "mask"]
         checked_multi = ["masks"]
