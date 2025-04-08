@@ -27,9 +27,9 @@ clear; close all; clc;
 
 
 dataset = 'CarDD';
-model = 'SAM2-UNet';
+model = 'MFFN';
 gtPath = 'D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\CarDD-TE-Mask';
-salPath = 'D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\SAM2-UNet\test_mask';
+salPath = 'D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\MFFN\test_mask';
 xlsxPath = ['D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\' model];
 csvPath = ['D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\' model];
 if ~isfolder(xlsxPath)

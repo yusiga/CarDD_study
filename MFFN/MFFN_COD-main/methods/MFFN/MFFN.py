@@ -286,7 +286,7 @@ class Progressive_Iteration(nn.Module):
         p1_input = self.p1_channel_reduction(x)
         p1 = self.p1(p1_input)
         p1_dc = self.p1_dc(p1)
-        p2_input = self.p2_channel_reduction(x) + p1_dc
+        p2_input = self.p2_channel_reduction(x) + p1_dc  # + ！！
         p2 = self.p2(p2_input)
         p2_dc = self.p2_dc(p2)
         p3_input = self.p3_channel_reduction(x) + p2_dc
@@ -383,11 +383,11 @@ class MFFN(BasicModelClass):
         dim = [64, 64, 64, 64, 64]
         size = [12, 24, 48, 96, 192]
         self.CAMV_layers = nn.ModuleList([CAMV(in_dim=in_c, mm_size=mm_s) for in_c, mm_s in zip(dim, size)])
-        self.d5 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
-        self.d4 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
-        self.d3 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
-        self.d2 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
-        self.d1 = nn.Sequential(CFU(64, num_groups=3, hidden_dim=32))
+        self.d5 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.d4 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.d3 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.d2 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.d1 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
         self.out_layer_00 = ConvBNReLU(64, 32, 3, 1, 1)
         self.out_layer_01 = nn.Conv2d(32, 1, 1)
 

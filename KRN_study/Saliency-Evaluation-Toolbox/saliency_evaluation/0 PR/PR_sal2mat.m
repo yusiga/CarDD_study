@@ -12,7 +12,7 @@ basedir = 'D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\';
 alg_dir = ...                                           
 {  
 % set the saliency map path as well as name.
- { 'SAM2-UNet', 'D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\SAM2-UNet\test_mask', [],'', 'png' };  %1. RGBD results\MPCI
+ { 'SAM2.1-UNet', 'D:\PycharmProjects\CarDD_release\CarDD_SOD\CarDD-TE\results\MFFN\test_mask', [],'', 'png' };  %1. RGBD results\MPCI
 % {'Ours', '/home/wlz/Downloads/caffe-future/models/finetune1/Experiments/ECSSD/map_Refcn-filter/', [],'' 'jpg'};
 };
 
@@ -23,7 +23,7 @@ dataset = datasetStructure( gt_dir(1), gt_dir(2) );
     performCalcu(dataset,alg_dir_FF); 
 
 
-save( [ basedir 'SAM2-UNet'], 'mPre', 'mRecall', 'mFmeasure', 'mHitRate', 'mFalseAlarm', 'AUC' );
+save( [ basedir 'MFFN'], 'mPre', 'mRecall', 'mFmeasure', 'mHitRate', 'mFalseAlarm', 'AUC' );
 
 curve_bar_plot( basedir, gt_dir, alg_dir, mPre, mRecall, mFmeasure, AUC );
 

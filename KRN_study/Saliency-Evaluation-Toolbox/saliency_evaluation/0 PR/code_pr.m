@@ -48,13 +48,25 @@ for i=1:length(dirpath)
     %  load([path num2str(aa(i)) '-filter.mat']);
     load([path dirpath(i).name]);
 
-    plot(mRecall,mPre,str(i),'linewidth',2);
+    % 对回召率和精度值进行平滑处理
+    % smoothedRecall = smooth(mRecall, 0.1, 'moving'); % 0.1 是平滑因子
+    % smoothedPrecision = smooth(mPre, 0.1, 'moving');
+
+    % 或者，你也可以使用插值来增加数据点
+    newRecall = linspace(min(mRecall), max(mRecall), 1000); % 500个插值点
+    newPrecision = interp1(mRecall, mPre, newRecall, 'pchip'); % 使用分段三次插值法
+
+    % 绘制平滑后的数据
+    plot(newRecall, newPrecision, str(i), 'LineWidth', 2);
+
+    % plot(mRecall,mPre,str(i),'linewidth',2);
 
 
     hold on;
     display([dirpath(i).name(1:end-4)])% '----' num2str(a)]);
     aa(i)=AUC;
-    rr=[rr;mRecall;mPre];
+    rr = [rr; newRecall; newPrecision]; % 存储平滑后的数据
+    % rr=[rr;mRecall;mPre];
     %  dirpath(i).name
     %  display(num2str(max(pM)));
 end
@@ -62,7 +74,7 @@ xlabel('Recall');
 ylabel('Precision');
 
 legend(...
-    dirpath(1).name(1:end-4),dirpath(2).name(1:end-4));
+    dirpath(1).name(1:end-4),dirpath(2).name(1:end-4),dirpath(3).name(1:end-4),dirpath(4).name(1:end-4));
 %,dirpath(3).name(1:end-4),dirpath(4).name(1:end-4),dirpath(5).name(1:end-4),dirpath(6).name(1:end-4),dirpath(7).name(1:end-4),dirpath(8).name(1:end-4)),dirpath(9).name(1:end-4),dirpath(10).name(1:end-4),dirpath(11).name(1:end-4),dirpath(12).name(1:end-4);%,dirpath(5).name(1:end-4),dirpath(6).name(1:end-4),dirpath(7).name(1:end-4));%,dirpath(4).name(1:end-4))%,dirpath(5).name(1:end-4),dirpath(6).name(1:end-4))
 %,dirpath(2).name(1:end-4),dirpath(3).name(1:end-4),dirpath(4).name(1:end-4),dirpath(5).name(1:end-4),dirpath(6).name(1:end-4),dirpath(7).name(1:end-4),dirpath(8).name(1:end-4)
 %,dirpath(5).name(1:end-4),dirpath(6).name(1:end-4),dirpath(7).name(1:end-4),dirpath(8).name(1:end-4),dirpath(9).name(1:end-4),dirpath(10).name(1:end-4)

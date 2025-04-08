@@ -1,0 +1,9 @@
+=== te_log 2025-04-07 19:38:03.707911 ===
+Results will be saved into /data1_ssd/gyy/CarDD/code/SOD/MFFN/output/MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo/pre/cardd_te
+Results on the testset(cardd_te): {
+    root: /data1_ssd/gyy/CarDD/data/CarDD_SOD/CarDD-TE
+    image: {'path': 'CarDD-TE-Image', 'suffix': '.jpg'}
+    mask: {'path': 'CarDD-TE-Mask', 'suffix': '.png'}
+    edge: {'path': 'CarDD-TE-Edge', 'suffix': '.png'}
+}
+{'Smeasure': '0.829', 'wFmeasure': '0.782', 'MAE': '0.054', 'adpEm': '0.897', 'meanEm': '0.899', 'maxEm': '0.910', 'adpFm': '0.818', 'meanFm': '0.824', 'maxFm': '0.833'}

@@ -1,0 +1,2080 @@
+=== tr_log 2025-04-07 19:38:03.707997 ===
+/data1_ssd/gyy/CarDD/code/SOD/MFFN with base_seed 0
+class MFFN(BasicModelClass):
+    def __init__(self):
+        super().__init__()
+        self.shared_encoder = timm.create_model(model_name="resnet50", pretrained=True, in_chans=3, features_only=True)
+        self.translayer = TransLayer(out_c=64)  # [c5, c4, c3, c2, c1]
+        dim = [64, 64, 64, 64, 64]
+        size = [12, 24, 48, 96, 192]
+        self.CAMV_layers = nn.ModuleList([CAMV(in_dim=in_c, mm_size=mm_s) for in_c, mm_s in zip(dim, size)])
+        self.d5 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.d4 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.d3 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.d2 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.d1 = nn.Sequential(CFU(64, num_groups=6, hidden_dim=32))
+        self.out_layer_00 = ConvBNReLU(64, 32, 3, 1, 1)
+        self.out_layer_01 = nn.Conv2d(32, 1, 1)
+
+    def encoder_translayer(self, x):
+        en_feats = self.shared_encoder(x)
+        trans_feats = self.translayer(en_feats)
+        return trans_feats
+    def body(self, c1_scale, o_scale, c2_scale, a1_scale, a2_scale):
+        c1_trans_feats = self.encoder_translayer(c1_scale)
+        o_trans_feats = self.encoder_translayer(o_scale)
+        c2_trans_feats = self.encoder_translayer(c2_scale)
+        a1_trans_feats = self.encoder_translayer(a1_scale)
+        a2_trans_feats = self.encoder_translayer(a2_scale)
+        feats = []
+        for c1, o,c2,a1,a2, layer in zip(c1_trans_feats, o_trans_feats, c2_trans_feats, a1_trans_feats, a2_trans_feats, self.CAMV_layers):
+            CAMV_outs = layer(c1=c1, o=o, c2=c2, a1=a1, a2=a2)
+            feats.append(CAMV_outs)
+
+        x = self.d5(feats[0])
+        x = cus_sample(x, mode="scale", factors=2)
+        x = self.d4(x + feats[1])
+        x = cus_sample(x, mode="scale", factors=2)
+        x = self.d3(x + feats[2])
+        x = cus_sample(x, mode="scale", factors=2)
+        x = self.d2(x + feats[3])
+        x = cus_sample(x, mode="scale", factors=2)
+        x = self.d1(x + feats[4])
+        x = cus_sample(x, mode="scale", factors=2)
+        logits = self.out_layer_01(self.out_layer_00(x))
+        return dict(seg=logits)
+    def train_forward(self, data, **kwargs):
+        assert not {"image_c1", "image_o", "image_c2", "image_a1", "image_a2", "mask"}.difference(set(data)), set(data)
+        output = self.body(
+            c1_scale=data["image_c1"],
+            o_scale=data["image_o"],
+            c2_scale=data["image_c2"],
+            a1_scale=data["image_a1"],
+            a2_scale=data["image_a2"],
+        )
+        loss, loss_str = self.cal_loss(
+            all_preds=output,
+            gts=data["mask"],
+            iter_percentage=kwargs["curr"]["iter_percentage"],
+        )
+        return dict(sal=output["seg"].sigmoid()), loss, loss_str
+
+    def test_forward(self, data, **kwargs):
+        output = self.body(
+            c1_scale=data["image_c1"],
+            o_scale=data["image_o"],
+            c2_scale=data["image_c2"],
+            a1_scale=data["image_a1"],
+            a2_scale=data["image_a2"],
+        )
+        return output["seg"]
+
+    def cal_loss(self, all_preds: dict, gts: torch.Tensor, method="cos", iter_percentage: float = 0):
+        ual_coef = get_coef(iter_percentage, method)
+        losses = []
+        loss_str = []
+        # for main
+        for name, preds in all_preds.items():
+            resized_gts = cus_sample(gts, mode="size", factors=preds.shape[2:])
+            sod_loss = F.binary_cross_entropy_with_logits(input=preds, target=resized_gts, reduction="mean")
+            losses.append(sod_loss)
+            loss_str.append(f"{name}_BCE: {sod_loss.item():.5f}")
+            ual_loss = cal_ual(seg_logits=preds, seg_gts=resized_gts)
+            ual_loss *= ual_coef
+            losses.append(ual_loss)
+            loss_str.append(f"{name}_UAL_{ual_coef:.5f}: {ual_loss.item():.5f}")
+        return sum(losses), " ".join(loss_str)
+
+    def get_grouped_params(self):
+        param_groups = {}
+        for name, param in self.named_parameters():
+            if name.startswith("shared_encoder.layer"):
+                param_groups.setdefault("pretrained", []).append(param)
+            elif name.startswith("shared_encoder."):
+                param_groups.setdefault("fixed", []).append(param)
+            else:
+                param_groups.setdefault("retrained", []).append(param)
+        return param_groups
+
+MFFN(
+  (shared_encoder): FeatureListNet(
+    (conv1): Conv2d(3, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+    (bn1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (act1): ReLU(inplace=True)
+    (maxpool): MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+    (layer1): Sequential(
+      (0): Bottleneck(
+        (conv1): Conv2d(64, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(64, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+        (downsample): Sequential(
+          (0): Conv2d(64, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        )
+      )
+      (1): Bottleneck(
+        (conv1): Conv2d(256, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(64, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+      (2): Bottleneck(
+        (conv1): Conv2d(256, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(64, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+    )
+    (layer2): Sequential(
+      (0): Bottleneck(
+        (conv1): Conv2d(256, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(128, 128, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+        (downsample): Sequential(
+          (0): Conv2d(256, 512, kernel_size=(1, 1), stride=(2, 2), bias=False)
+          (1): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        )
+      )
+      (1): Bottleneck(
+        (conv1): Conv2d(512, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+      (2): Bottleneck(
+        (conv1): Conv2d(512, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+      (3): Bottleneck(
+        (conv1): Conv2d(512, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+    )
+    (layer3): Sequential(
+      (0): Bottleneck(
+        (conv1): Conv2d(512, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(256, 256, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(256, 1024, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+        (downsample): Sequential(
+          (0): Conv2d(512, 1024, kernel_size=(1, 1), stride=(2, 2), bias=False)
+          (1): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        )
+      )
+      (1): Bottleneck(
+        (conv1): Conv2d(1024, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(256, 1024, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+      (2): Bottleneck(
+        (conv1): Conv2d(1024, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(256, 1024, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+      (3): Bottleneck(
+        (conv1): Conv2d(1024, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(256, 1024, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+      (4): Bottleneck(
+        (conv1): Conv2d(1024, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(256, 1024, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+      (5): Bottleneck(
+        (conv1): Conv2d(1024, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(256, 1024, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+    )
+    (layer4): Sequential(
+      (0): Bottleneck(
+        (conv1): Conv2d(1024, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(512, 512, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(512, 2048, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(2048, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+        (downsample): Sequential(
+          (0): Conv2d(1024, 2048, kernel_size=(1, 1), stride=(2, 2), bias=False)
+          (1): BatchNorm2d(2048, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        )
+      )
+      (1): Bottleneck(
+        (conv1): Conv2d(2048, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(512, 2048, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(2048, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+      (2): Bottleneck(
+        (conv1): Conv2d(2048, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act1): ReLU(inplace=True)
+        (conv2): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn2): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act2): ReLU(inplace=True)
+        (conv3): Conv2d(512, 2048, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn3): BatchNorm2d(2048, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (act3): ReLU(inplace=True)
+      )
+    )
+  )
+  (translayer): TransLayer(
+    (c5_down): Sequential(
+      (0): ASPP(
+        (conv1): ConvBNReLU(
+          (conv): Conv2d(2048, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (conv2): ConvBNReLU(
+          (conv): Conv2d(2048, 64, kernel_size=(3, 3), stride=(1, 1), padding=(2, 2), dilation=(2, 2), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (conv3): ConvBNReLU(
+          (conv): Conv2d(2048, 64, kernel_size=(3, 3), stride=(1, 1), padding=(5, 5), dilation=(5, 5), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (conv4): ConvBNReLU(
+          (conv): Conv2d(2048, 64, kernel_size=(3, 3), stride=(1, 1), padding=(7, 7), dilation=(7, 7), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (conv5): ConvBNReLU(
+          (conv): Conv2d(2048, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (fuse): ConvBNReLU(
+          (conv): Conv2d(320, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+    )
+    (c4_down): Sequential(
+      (0): ConvBNReLU(
+        (conv): Conv2d(1024, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+    )
+    (c3_down): Sequential(
+      (0): ConvBNReLU(
+        (conv): Conv2d(512, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+    )
+    (c2_down): Sequential(
+      (0): ConvBNReLU(
+        (conv): Conv2d(256, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+    )
+    (c1_down): Sequential(
+      (0): ConvBNReLU(
+        (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+    )
+  )
+  (CAMV_layers): ModuleList(
+    (0-4): 5 x CAMV(
+      (conv_l_pre_down): ConvBNReLU(
+        (conv): Conv2d(64, 64, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2), bias=False)
+        (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+      (conv_l_post_down): ConvBNReLU(
+        (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+      (conv_m): Sequential(
+        (0): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (conv_s_pre_up): ConvBNReLU(
+        (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+      (conv_s_post_up): ConvBNReLU(
+        (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+      (trans): Sequential(
+        (0): ConvBNReLU(
+          (conv): Conv2d(192, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(192, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (2): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (trans1): Sequential(
+        (0): ConvBNReLU(
+          (conv): Conv2d(192, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(192, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (2): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (transa1): Sequential(
+        (0): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (transa2): Sequential(
+        (0): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (channel_attn): ChannelAttention(
+        (avg_pool): AdaptiveAvgPool2d(output_size=1)
+        (max_pool): AdaptiveMaxPool2d(output_size=1)
+        (fc1): Conv2d(64, 8, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (relu1): ReLU()
+        (fc2): Conv2d(8, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (sigmoid): Sigmoid()
+      )
+      (spatial_attn): SpatialAttention(
+        (conv1): Conv2d(2, 1, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3), bias=False)
+        (sigmoid): Sigmoid()
+      )
+      (fuse): Sequential(
+        (0): ConvBNReLU(
+          (conv): Conv2d(128, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(128, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (2): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+    )
+  )
+  (d5): Sequential(
+    (0): CFU(
+      (expand_conv): ConvBNReLU(
+        (conv): Conv2d(64, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+      (interact): ModuleDict(
+        (0): ConvBNReLU(
+          (conv): Conv2d(32, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (2): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (3): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (4): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (5): ConvBNReLU(
+          (conv): Conv2d(64, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (fuse): Sequential(
+        (0): Conv2d(192, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+      )
+      (final_relu): ReLU(inplace=True)
+      (fp): Progressive_Iteration(
+        (p1_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(2, 2), dilation=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(4, 4), dilation=(4, 4))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(8, 8), dilation=(8, 8))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (fusion): Sequential(
+          (0): Conv2d(192, 192, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+      )
+    )
+  )
+  (d4): Sequential(
+    (0): CFU(
+      (expand_conv): ConvBNReLU(
+        (conv): Conv2d(64, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+      (interact): ModuleDict(
+        (0): ConvBNReLU(
+          (conv): Conv2d(32, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (2): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (3): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (4): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (5): ConvBNReLU(
+          (conv): Conv2d(64, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (fuse): Sequential(
+        (0): Conv2d(192, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+      )
+      (final_relu): ReLU(inplace=True)
+      (fp): Progressive_Iteration(
+        (p1_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(2, 2), dilation=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(4, 4), dilation=(4, 4))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(8, 8), dilation=(8, 8))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (fusion): Sequential(
+          (0): Conv2d(192, 192, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+      )
+    )
+  )
+  (d3): Sequential(
+    (0): CFU(
+      (expand_conv): ConvBNReLU(
+        (conv): Conv2d(64, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+      (interact): ModuleDict(
+        (0): ConvBNReLU(
+          (conv): Conv2d(32, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (2): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (3): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (4): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (5): ConvBNReLU(
+          (conv): Conv2d(64, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (fuse): Sequential(
+        (0): Conv2d(192, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+      )
+      (final_relu): ReLU(inplace=True)
+      (fp): Progressive_Iteration(
+        (p1_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(2, 2), dilation=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(4, 4), dilation=(4, 4))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(8, 8), dilation=(8, 8))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (fusion): Sequential(
+          (0): Conv2d(192, 192, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+      )
+    )
+  )
+  (d2): Sequential(
+    (0): CFU(
+      (expand_conv): ConvBNReLU(
+        (conv): Conv2d(64, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+      (interact): ModuleDict(
+        (0): ConvBNReLU(
+          (conv): Conv2d(32, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (2): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (3): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (4): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (5): ConvBNReLU(
+          (conv): Conv2d(64, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (fuse): Sequential(
+        (0): Conv2d(192, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+      )
+      (final_relu): ReLU(inplace=True)
+      (fp): Progressive_Iteration(
+        (p1_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(2, 2), dilation=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(4, 4), dilation=(4, 4))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(8, 8), dilation=(8, 8))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (fusion): Sequential(
+          (0): Conv2d(192, 192, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+      )
+    )
+  )
+  (d1): Sequential(
+    (0): CFU(
+      (expand_conv): ConvBNReLU(
+        (conv): Conv2d(64, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (relu): ReLU(inplace=True)
+      )
+      (interact): ModuleDict(
+        (0): ConvBNReLU(
+          (conv): Conv2d(32, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (1): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (2): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (3): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (4): ConvBNReLU(
+          (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+        (5): ConvBNReLU(
+          (conv): Conv2d(64, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (bn): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (relu): ReLU(inplace=True)
+        )
+      )
+      (fuse): Sequential(
+        (0): Conv2d(192, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+      )
+      (final_relu): ReLU(inplace=True)
+      (fp): Progressive_Iteration(
+        (p1_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_channel_reduction): Sequential(
+          (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p1_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p2_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(2, 2), dilation=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p3_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(4, 4), dilation=(4, 4))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (p4_dc): Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(8, 8), dilation=(8, 8))
+          (1): BatchNorm2d(48, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+        (fusion): Sequential(
+          (0): Conv2d(192, 192, kernel_size=(1, 1), stride=(1, 1))
+          (1): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (2): ReLU()
+        )
+      )
+    )
+  )
+  (out_layer_00): ConvBNReLU(
+    (conv): Conv2d(64, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+    (bn): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (relu): ReLU(inplace=True)
+  )
+  (out_layer_01): Conv2d(32, 1, kernel_size=(1, 1), stride=(1, 1))
+)
+Scheduler:
+Scheduler: (
+    num_iters: 17600
+    epoch_length: 352
+    warmup_iter: [0, 0)
+    scheduler_iter: [0, 17599]
+    mode: f3
+    scheduler_cfg: {'warmup': {'num_iters': 0, 'initial_coef': 0.01, 'mode': 'linear'}, 'mode': 'f3', 'cfg': {'lr_decay': 0.9, 'min_coef': 0.001}}
+    initial_lrs: [0.005000000000000001, 0.05]
+    step_by_batch: True
+)
+Optimizer:
+SGD (
+Parameter Group 0
+    dampening: 0
+    differentiable: False
+    foreach: None
+    fused: None
+    lr: 0.005000000000000001
+    maximize: False
+    momentum: 0.9
+    nesterov: False
+    weight_decay: 0.0005
+
+Parameter Group 1
+    dampening: 0
+    differentiable: False
+    foreach: None
+    fused: None
+    lr: 0.05
+    maximize: False
+    momentum: 0.9
+    nesterov: False
+    weight_decay: 0.0005
+)
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:0:17600 0/352 0/50 | Lr: 5.682e-07, 5.682e-06 | M:0.73153/C:0.73153 | [8, 1, 384, 384] | seg_BCE: 0.73153 seg_UAL_0.00000: 0.00000
+I:20:17600 20/352 0/50 | Lr: 1.193e-05, 1.193e-04 | M:0.73366/C:0.74224 | [8, 1, 384, 384] | seg_BCE: 0.74224 seg_UAL_0.00000: 0.00000
+I:40:17600 40/352 0/50 | Lr: 2.330e-05, 2.330e-04 | M:0.72664/C:0.70723 | [8, 1, 384, 384] | seg_BCE: 0.70722 seg_UAL_0.00001: 0.00001
+I:60:17600 60/352 0/50 | Lr: 3.466e-05, 3.466e-04 | M:0.71409/C:0.66570 | [8, 1, 384, 384] | seg_BCE: 0.66567 seg_UAL_0.00003: 0.00003
+I:80:17600 80/352 0/50 | Lr: 4.602e-05, 4.602e-04 | M:0.69636/C:0.61836 | [8, 1, 384, 384] | seg_BCE: 0.61831 seg_UAL_0.00005: 0.00005
+I:100:17600 100/352 0/50 | Lr: 5.739e-05, 5.739e-04 | M:0.67898/C:0.58225 | [8, 1, 384, 384] | seg_BCE: 0.58217 seg_UAL_0.00008: 0.00007
+I:120:17600 120/352 0/50 | Lr: 6.875e-05, 6.875e-04 | M:0.65929/C:0.53693 | [8, 1, 384, 384] | seg_BCE: 0.53683 seg_UAL_0.00011: 0.00010
+I:140:17600 140/352 0/50 | Lr: 8.011e-05, 8.011e-04 | M:0.63919/C:0.48096 | [8, 1, 384, 384] | seg_BCE: 0.48083 seg_UAL_0.00016: 0.00013
+I:160:17600 160/352 0/50 | Lr: 9.148e-05, 9.148e-04 | M:0.62264/C:0.55358 | [8, 1, 384, 384] | seg_BCE: 0.55342 seg_UAL_0.00020: 0.00016
+I:180:17600 180/352 0/50 | Lr: 1.028e-04, 1.028e-03 | M:0.60637/C:0.50768 | [8, 1, 384, 384] | seg_BCE: 0.50748 seg_UAL_0.00026: 0.00020
+I:200:17600 200/352 0/50 | Lr: 1.142e-04, 1.142e-03 | M:0.58989/C:0.43148 | [8, 1, 384, 384] | seg_BCE: 0.43125 seg_UAL_0.00032: 0.00023
+I:220:17600 220/352 0/50 | Lr: 1.256e-04, 1.256e-03 | M:0.57383/C:0.45280 | [8, 1, 384, 384] | seg_BCE: 0.45254 seg_UAL_0.00039: 0.00026
+I:240:17600 240/352 0/50 | Lr: 1.369e-04, 1.369e-03 | M:0.55887/C:0.42996 | [8, 1, 384, 384] | seg_BCE: 0.42967 seg_UAL_0.00046: 0.00029
+I:260:17600 260/352 0/50 | Lr: 1.483e-04, 1.483e-03 | M:0.54487/C:0.34018 | [8, 1, 384, 384] | seg_BCE: 0.33985 seg_UAL_0.00054: 0.00033
+I:280:17600 280/352 0/50 | Lr: 1.597e-04, 1.597e-03 | M:0.53202/C:0.37374 | [8, 1, 384, 384] | seg_BCE: 0.37338 seg_UAL_0.00062: 0.00036
+I:300:17600 300/352 0/50 | Lr: 1.710e-04, 1.710e-03 | M:0.52010/C:0.31903 | [8, 1, 384, 384] | seg_BCE: 0.31864 seg_UAL_0.00072: 0.00039
+I:320:17600 320/352 0/50 | Lr: 1.824e-04, 1.824e-03 | M:0.51050/C:0.46301 | [8, 1, 384, 384] | seg_BCE: 0.46258 seg_UAL_0.00082: 0.00043
+I:340:17600 340/352 0/50 | Lr: 1.937e-04, 1.937e-03 | M:0.50183/C:0.35901 | [8, 1, 384, 384] | seg_BCE: 0.35854 seg_UAL_0.00092: 0.00047
+I:351:17600 351/352 0/50 | Lr: 2.000e-04, 2.000e-03 | M:0.49677/C:0.30226 | [8, 1, 384, 384] | seg_BCE: 0.30177 seg_UAL_0.00098: 0.00050
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:360:17600 8/352 1/50 | Lr: 2.051e-04, 2.051e-03 | M:0.33558/C:0.35224 | [8, 1, 384, 384] | seg_BCE: 0.35172 seg_UAL_0.00103: 0.00052
+I:380:17600 28/352 1/50 | Lr: 2.165e-04, 2.165e-03 | M:0.35177/C:0.47514 | [8, 1, 384, 384] | seg_BCE: 0.47460 seg_UAL_0.00115: 0.00054
+I:400:17600 48/352 1/50 | Lr: 2.278e-04, 2.278e-03 | M:0.33555/C:0.30777 | [8, 1, 384, 384] | seg_BCE: 0.30718 seg_UAL_0.00127: 0.00060
+I:420:17600 68/352 1/50 | Lr: 2.392e-04, 2.392e-03 | M:0.33194/C:0.29724 | [8, 1, 384, 384] | seg_BCE: 0.29659 seg_UAL_0.00140: 0.00064
+I:440:17600 88/352 1/50 | Lr: 2.506e-04, 2.506e-03 | M:0.32758/C:0.22543 | [8, 1, 384, 384] | seg_BCE: 0.22477 seg_UAL_0.00154: 0.00065
+I:460:17600 108/352 1/50 | Lr: 2.619e-04, 2.619e-03 | M:0.32549/C:0.26986 | [8, 1, 384, 384] | seg_BCE: 0.26912 seg_UAL_0.00168: 0.00074
+I:480:17600 128/352 1/50 | Lr: 2.733e-04, 2.733e-03 | M:0.32462/C:0.32871 | [8, 1, 384, 384] | seg_BCE: 0.32792 seg_UAL_0.00183: 0.00079
+I:500:17600 148/352 1/50 | Lr: 2.847e-04, 2.847e-03 | M:0.33055/C:0.34026 | [8, 1, 384, 384] | seg_BCE: 0.33937 seg_UAL_0.00199: 0.00088
+I:520:17600 168/352 1/50 | Lr: 2.960e-04, 2.960e-03 | M:0.33059/C:0.36824 | [8, 1, 384, 384] | seg_BCE: 0.36731 seg_UAL_0.00215: 0.00093
+I:540:17600 188/352 1/50 | Lr: 3.074e-04, 3.074e-03 | M:0.32749/C:0.37715 | [8, 1, 384, 384] | seg_BCE: 0.37618 seg_UAL_0.00232: 0.00097
+I:560:17600 208/352 1/50 | Lr: 3.187e-04, 3.187e-03 | M:0.32608/C:0.29057 | [8, 1, 384, 384] | seg_BCE: 0.28950 seg_UAL_0.00250: 0.00107
+I:580:17600 228/352 1/50 | Lr: 3.301e-04, 3.301e-03 | M:0.32263/C:0.25701 | [8, 1, 384, 384] | seg_BCE: 0.25597 seg_UAL_0.00268: 0.00104
+I:600:17600 248/352 1/50 | Lr: 3.415e-04, 3.415e-03 | M:0.32400/C:0.39404 | [8, 1, 384, 384] | seg_BCE: 0.39284 seg_UAL_0.00286: 0.00120
+I:620:17600 268/352 1/50 | Lr: 3.528e-04, 3.528e-03 | M:0.32118/C:0.25491 | [8, 1, 384, 384] | seg_BCE: 0.25366 seg_UAL_0.00306: 0.00125
+I:640:17600 288/352 1/50 | Lr: 3.642e-04, 3.642e-03 | M:0.32107/C:0.23006 | [8, 1, 384, 384] | seg_BCE: 0.22883 seg_UAL_0.00326: 0.00123
+I:660:17600 308/352 1/50 | Lr: 3.756e-04, 3.756e-03 | M:0.32031/C:0.30782 | [8, 1, 384, 384] | seg_BCE: 0.30632 seg_UAL_0.00347: 0.00150
+I:680:17600 328/352 1/50 | Lr: 3.869e-04, 3.869e-03 | M:0.31996/C:0.30054 | [8, 1, 384, 384] | seg_BCE: 0.29910 seg_UAL_0.00368: 0.00144
+I:700:17600 348/352 1/50 | Lr: 3.983e-04, 3.983e-03 | M:0.31786/C:0.27263 | [8, 1, 384, 384] | seg_BCE: 0.27120 seg_UAL_0.00390: 0.00143
+I:703:17600 351/352 1/50 | Lr: 4.000e-04, 4.000e-03 | M:0.31758/C:0.33434 | [8, 1, 384, 384] | seg_BCE: 0.33277 seg_UAL_0.00393: 0.00157
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:720:17600 16/352 2/50 | Lr: 4.097e-04, 4.097e-03 | M:0.31028/C:0.43035 | [8, 1, 384, 384] | seg_BCE: 0.42871 seg_UAL_0.00412: 0.00164
+I:740:17600 36/352 2/50 | Lr: 4.210e-04, 4.210e-03 | M:0.28884/C:0.27862 | [8, 1, 384, 384] | seg_BCE: 0.27698 seg_UAL_0.00436: 0.00165
+I:760:17600 56/352 2/50 | Lr: 4.324e-04, 4.324e-03 | M:0.28574/C:0.39893 | [8, 1, 384, 384] | seg_BCE: 0.39733 seg_UAL_0.00459: 0.00160
+I:780:17600 76/352 2/50 | Lr: 4.438e-04, 4.437e-03 | M:0.28627/C:0.34803 | [8, 1, 384, 384] | seg_BCE: 0.34625 seg_UAL_0.00484: 0.00178
+I:800:17600 96/352 2/50 | Lr: 4.551e-04, 4.551e-03 | M:0.28442/C:0.23964 | [8, 1, 384, 384] | seg_BCE: 0.23776 seg_UAL_0.00509: 0.00188
+I:820:17600 116/352 2/50 | Lr: 4.665e-04, 4.665e-03 | M:0.27652/C:0.22153 | [8, 1, 384, 384] | seg_BCE: 0.21977 seg_UAL_0.00535: 0.00176
+I:840:17600 136/352 2/50 | Lr: 4.778e-04, 4.778e-03 | M:0.27332/C:0.32277 | [8, 1, 384, 384] | seg_BCE: 0.32109 seg_UAL_0.00561: 0.00168
+I:860:17600 156/352 2/50 | Lr: 4.892e-04, 4.892e-03 | M:0.27289/C:0.24705 | [8, 1, 384, 384] | seg_BCE: 0.24512 seg_UAL_0.00588: 0.00193
+I:880:17600 176/352 2/50 | Lr: 5.006e-04, 5.006e-03 | M:0.27036/C:0.22138 | [8, 1, 384, 384] | seg_BCE: 0.21961 seg_UAL_0.00616: 0.00176
+I:900:17600 196/352 2/50 | Lr: 5.119e-04, 5.119e-03 | M:0.27086/C:0.20378 | [8, 1, 384, 384] | seg_BCE: 0.20179 seg_UAL_0.00644: 0.00199
+I:920:17600 216/352 2/50 | Lr: 5.233e-04, 5.233e-03 | M:0.26915/C:0.23841 | [8, 1, 384, 384] | seg_BCE: 0.23623 seg_UAL_0.00673: 0.00219
+I:940:17600 236/352 2/50 | Lr: 5.347e-04, 5.347e-03 | M:0.26782/C:0.21451 | [8, 1, 384, 384] | seg_BCE: 0.21219 seg_UAL_0.00702: 0.00233
+I:960:17600 256/352 2/50 | Lr: 5.460e-04, 5.460e-03 | M:0.26910/C:0.39513 | [8, 1, 384, 384] | seg_BCE: 0.39247 seg_UAL_0.00732: 0.00266
+I:980:17600 276/352 2/50 | Lr: 5.574e-04, 5.574e-03 | M:0.26825/C:0.36247 | [8, 1, 384, 384] | seg_BCE: 0.36012 seg_UAL_0.00763: 0.00235
+I:1000:17600 296/352 2/50 | Lr: 5.688e-04, 5.688e-03 | M:0.26959/C:0.42179 | [8, 1, 384, 384] | seg_BCE: 0.41917 seg_UAL_0.00794: 0.00263
+I:1020:17600 316/352 2/50 | Lr: 5.801e-04, 5.801e-03 | M:0.26913/C:0.23775 | [8, 1, 384, 384] | seg_BCE: 0.23487 seg_UAL_0.00826: 0.00288
+I:1040:17600 336/352 2/50 | Lr: 5.915e-04, 5.915e-03 | M:0.26749/C:0.21040 | [8, 1, 384, 384] | seg_BCE: 0.20772 seg_UAL_0.00859: 0.00268
+I:1055:17600 351/352 2/50 | Lr: 6.000e-04, 6.000e-03 | M:0.26678/C:0.26308 | [8, 1, 384, 384] | seg_BCE: 0.26018 seg_UAL_0.00884: 0.00291
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:1060:17600 4/352 3/50 | Lr: 6.028e-04, 6.028e-03 | M:0.25852/C:0.20802 | [8, 1, 384, 384] | seg_BCE: 0.20534 seg_UAL_0.00892: 0.00268
+I:1080:17600 24/352 3/50 | Lr: 6.142e-04, 6.142e-03 | M:0.24066/C:0.30149 | [8, 1, 384, 384] | seg_BCE: 0.29845 seg_UAL_0.00926: 0.00304
+I:1100:17600 44/352 3/50 | Lr: 6.256e-04, 6.256e-03 | M:0.24221/C:0.29849 | [8, 1, 384, 384] | seg_BCE: 0.29542 seg_UAL_0.00961: 0.00308
+I:1120:17600 64/352 3/50 | Lr: 6.369e-04, 6.369e-03 | M:0.23903/C:0.31746 | [8, 1, 384, 384] | seg_BCE: 0.31438 seg_UAL_0.00996: 0.00308
+I:1140:17600 84/352 3/50 | Lr: 6.483e-04, 6.483e-03 | M:0.23661/C:0.26884 | [8, 1, 384, 384] | seg_BCE: 0.26574 seg_UAL_0.01032: 0.00310
+I:1160:17600 104/352 3/50 | Lr: 6.597e-04, 6.597e-03 | M:0.23492/C:0.22078 | [8, 1, 384, 384] | seg_BCE: 0.21754 seg_UAL_0.01068: 0.00324
+I:1180:17600 124/352 3/50 | Lr: 6.710e-04, 6.710e-03 | M:0.23127/C:0.17719 | [8, 1, 384, 384] | seg_BCE: 0.17420 seg_UAL_0.01105: 0.00299
+I:1200:17600 144/352 3/50 | Lr: 6.824e-04, 6.824e-03 | M:0.23608/C:0.19111 | [8, 1, 384, 384] | seg_BCE: 0.18807 seg_UAL_0.01143: 0.00303
+I:1220:17600 164/352 3/50 | Lr: 6.938e-04, 6.938e-03 | M:0.23911/C:0.18174 | [8, 1, 384, 384] | seg_BCE: 0.17845 seg_UAL_0.01181: 0.00328
+I:1240:17600 184/352 3/50 | Lr: 7.051e-04, 7.051e-03 | M:0.23652/C:0.22048 | [8, 1, 384, 384] | seg_BCE: 0.21723 seg_UAL_0.01220: 0.00325
+I:1260:17600 204/352 3/50 | Lr: 7.165e-04, 7.165e-03 | M:0.23383/C:0.19673 | [8, 1, 384, 384] | seg_BCE: 0.19343 seg_UAL_0.01259: 0.00330
+I:1280:17600 224/352 3/50 | Lr: 7.278e-04, 7.278e-03 | M:0.23212/C:0.18987 | [8, 1, 384, 384] | seg_BCE: 0.18674 seg_UAL_0.01299: 0.00313
+I:1300:17600 244/352 3/50 | Lr: 7.392e-04, 7.392e-03 | M:0.23332/C:0.20224 | [8, 1, 384, 384] | seg_BCE: 0.19831 seg_UAL_0.01340: 0.00393
+I:1320:17600 264/352 3/50 | Lr: 7.506e-04, 7.506e-03 | M:0.23338/C:0.24655 | [8, 1, 384, 384] | seg_BCE: 0.24267 seg_UAL_0.01382: 0.00388
+I:1340:17600 284/352 3/50 | Lr: 7.619e-04, 7.619e-03 | M:0.23672/C:0.17979 | [8, 1, 384, 384] | seg_BCE: 0.17562 seg_UAL_0.01423: 0.00416
+I:1360:17600 304/352 3/50 | Lr: 7.733e-04, 7.733e-03 | M:0.23786/C:0.22436 | [8, 1, 384, 384] | seg_BCE: 0.21994 seg_UAL_0.01466: 0.00442
+I:1380:17600 324/352 3/50 | Lr: 7.847e-04, 7.847e-03 | M:0.23781/C:0.25978 | [8, 1, 384, 384] | seg_BCE: 0.25558 seg_UAL_0.01509: 0.00420
+I:1400:17600 344/352 3/50 | Lr: 7.960e-04, 7.960e-03 | M:0.23718/C:0.19279 | [8, 1, 384, 384] | seg_BCE: 0.18849 seg_UAL_0.01553: 0.00430
+I:1407:17600 351/352 3/50 | Lr: 8.000e-04, 8.000e-03 | M:0.23657/C:0.24858 | [8, 1, 384, 384] | seg_BCE: 0.24421 seg_UAL_0.01569: 0.00438
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:1420:17600 12/352 4/50 | Lr: 8.074e-04, 8.074e-03 | M:0.21835/C:0.34687 | [8, 1, 384, 384] | seg_BCE: 0.34171 seg_UAL_0.01598: 0.00516
+I:1440:17600 32/352 4/50 | Lr: 8.188e-04, 8.188e-03 | M:0.21649/C:0.25966 | [8, 1, 384, 384] | seg_BCE: 0.25546 seg_UAL_0.01643: 0.00420
+I:1460:17600 52/352 4/50 | Lr: 8.301e-04, 8.301e-03 | M:0.22147/C:0.18442 | [8, 1, 384, 384] | seg_BCE: 0.17994 seg_UAL_0.01688: 0.00448
+I:1480:17600 72/352 4/50 | Lr: 8.415e-04, 8.415e-03 | M:0.22045/C:0.21668 | [8, 1, 384, 384] | seg_BCE: 0.21208 seg_UAL_0.01735: 0.00460
+I:1500:17600 92/352 4/50 | Lr: 8.528e-04, 8.528e-03 | M:0.21551/C:0.16657 | [8, 1, 384, 384] | seg_BCE: 0.16184 seg_UAL_0.01782: 0.00473
+I:1520:17600 112/352 4/50 | Lr: 8.642e-04, 8.642e-03 | M:0.21543/C:0.14388 | [8, 1, 384, 384] | seg_BCE: 0.13971 seg_UAL_0.01829: 0.00417
+I:1540:17600 132/352 4/50 | Lr: 8.756e-04, 8.756e-03 | M:0.21380/C:0.26640 | [8, 1, 384, 384] | seg_BCE: 0.26197 seg_UAL_0.01877: 0.00442
+I:1560:17600 152/352 4/50 | Lr: 8.869e-04, 8.869e-03 | M:0.21250/C:0.22163 | [8, 1, 384, 384] | seg_BCE: 0.21633 seg_UAL_0.01926: 0.00529
+I:1580:17600 172/352 4/50 | Lr: 8.983e-04, 8.983e-03 | M:0.21075/C:0.18237 | [8, 1, 384, 384] | seg_BCE: 0.17810 seg_UAL_0.01975: 0.00427
+I:1600:17600 192/352 4/50 | Lr: 9.097e-04, 9.097e-03 | M:0.21299/C:0.26384 | [8, 1, 384, 384] | seg_BCE: 0.25744 seg_UAL_0.02025: 0.00640
+I:1620:17600 212/352 4/50 | Lr: 9.210e-04, 9.210e-03 | M:0.21550/C:0.20150 | [8, 1, 384, 384] | seg_BCE: 0.19591 seg_UAL_0.02076: 0.00559
+I:1640:17600 232/352 4/50 | Lr: 9.324e-04, 9.324e-03 | M:0.21447/C:0.23897 | [8, 1, 384, 384] | seg_BCE: 0.23341 seg_UAL_0.02127: 0.00556
+I:1660:17600 252/352 4/50 | Lr: 9.438e-04, 9.437e-03 | M:0.21681/C:0.12647 | [8, 1, 384, 384] | seg_BCE: 0.12134 seg_UAL_0.02179: 0.00513
+I:1680:17600 272/352 4/50 | Lr: 9.551e-04, 9.551e-03 | M:0.21748/C:0.24434 | [8, 1, 384, 384] | seg_BCE: 0.23815 seg_UAL_0.02231: 0.00619
+I:1700:17600 292/352 4/50 | Lr: 9.665e-04, 9.665e-03 | M:0.21705/C:0.32340 | [8, 1, 384, 384] | seg_BCE: 0.31760 seg_UAL_0.02284: 0.00580
+I:1720:17600 312/352 4/50 | Lr: 9.778e-04, 9.778e-03 | M:0.21748/C:0.18754 | [8, 1, 384, 384] | seg_BCE: 0.18181 seg_UAL_0.02338: 0.00573
+I:1740:17600 332/352 4/50 | Lr: 9.892e-04, 9.892e-03 | M:0.21719/C:0.14024 | [8, 1, 384, 384] | seg_BCE: 0.13466 seg_UAL_0.02392: 0.00557
+I:1759:17600 351/352 4/50 | Lr: 1.000e-03, 1.000e-02 | M:0.21660/C:0.25879 | [8, 1, 384, 384] | seg_BCE: 0.25348 seg_UAL_0.02444: 0.00531
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:1760:17600 0/352 5/50 | Lr: 1.001e-03, 1.001e-02 | M:0.16359/C:0.16359 | [8, 1, 384, 384] | seg_BCE: 0.15729 seg_UAL_0.02447: 0.00630
+I:1780:17600 20/352 5/50 | Lr: 1.012e-03, 1.012e-02 | M:0.18240/C:0.16406 | [8, 1, 384, 384] | seg_BCE: 0.15852 seg_UAL_0.02503: 0.00553
+I:1800:17600 40/352 5/50 | Lr: 1.023e-03, 1.023e-02 | M:0.18356/C:0.18599 | [8, 1, 384, 384] | seg_BCE: 0.18080 seg_UAL_0.02559: 0.00519
+I:1820:17600 60/352 5/50 | Lr: 1.035e-03, 1.035e-02 | M:0.19144/C:0.23605 | [8, 1, 384, 384] | seg_BCE: 0.22869 seg_UAL_0.02615: 0.00736
+I:1840:17600 80/352 5/50 | Lr: 1.046e-03, 1.046e-02 | M:0.19654/C:0.18583 | [8, 1, 384, 384] | seg_BCE: 0.18003 seg_UAL_0.02673: 0.00580
+I:1860:17600 100/352 5/50 | Lr: 1.057e-03, 1.057e-02 | M:0.19143/C:0.16902 | [8, 1, 384, 384] | seg_BCE: 0.16326 seg_UAL_0.02731: 0.00576
+I:1880:17600 120/352 5/50 | Lr: 1.069e-03, 1.069e-02 | M:0.19073/C:0.14378 | [8, 1, 384, 384] | seg_BCE: 0.13877 seg_UAL_0.02789: 0.00501
+I:1900:17600 140/352 5/50 | Lr: 1.080e-03, 1.080e-02 | M:0.19241/C:0.19335 | [8, 1, 384, 384] | seg_BCE: 0.18613 seg_UAL_0.02848: 0.00723
+I:1920:17600 160/352 5/50 | Lr: 1.091e-03, 1.091e-02 | M:0.19382/C:0.14693 | [8, 1, 384, 384] | seg_BCE: 0.14143 seg_UAL_0.02908: 0.00550
+I:1940:17600 180/352 5/50 | Lr: 1.103e-03, 1.103e-02 | M:0.19364/C:0.13541 | [8, 1, 384, 384] | seg_BCE: 0.12923 seg_UAL_0.02968: 0.00618
+I:1960:17600 200/352 5/50 | Lr: 1.114e-03, 1.114e-02 | M:0.19297/C:0.22477 | [8, 1, 384, 384] | seg_BCE: 0.21860 seg_UAL_0.03029: 0.00617
+I:1980:17600 220/352 5/50 | Lr: 1.126e-03, 1.126e-02 | M:0.19353/C:0.12150 | [8, 1, 384, 384] | seg_BCE: 0.11537 seg_UAL_0.03090: 0.00612
+I:2000:17600 240/352 5/50 | Lr: 1.137e-03, 1.137e-02 | M:0.19435/C:0.23335 | [8, 1, 384, 384] | seg_BCE: 0.22562 seg_UAL_0.03153: 0.00773
+I:2020:17600 260/352 5/50 | Lr: 1.148e-03, 1.148e-02 | M:0.19371/C:0.23831 | [8, 1, 384, 384] | seg_BCE: 0.23023 seg_UAL_0.03215: 0.00809
+I:2040:17600 280/352 5/50 | Lr: 1.160e-03, 1.160e-02 | M:0.19522/C:0.29138 | [8, 1, 384, 384] | seg_BCE: 0.28405 seg_UAL_0.03278: 0.00733
+I:2060:17600 300/352 5/50 | Lr: 1.171e-03, 1.171e-02 | M:0.19596/C:0.15577 | [8, 1, 384, 384] | seg_BCE: 0.14982 seg_UAL_0.03342: 0.00595
+I:2080:17600 320/352 5/50 | Lr: 1.182e-03, 1.182e-02 | M:0.19647/C:0.14741 | [8, 1, 384, 384] | seg_BCE: 0.14006 seg_UAL_0.03407: 0.00735
+I:2100:17600 340/352 5/50 | Lr: 1.194e-03, 1.194e-02 | M:0.19603/C:0.16575 | [8, 1, 384, 384] | seg_BCE: 0.15921 seg_UAL_0.03472: 0.00653
+I:2111:17600 351/352 5/50 | Lr: 1.200e-03, 1.200e-02 | M:0.19532/C:0.10466 | [8, 1, 384, 384] | seg_BCE: 0.09813 seg_UAL_0.03508: 0.00652
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:2120:17600 8/352 6/50 | Lr: 1.205e-03, 1.205e-02 | M:0.20542/C:0.21957 | [8, 1, 384, 384] | seg_BCE: 0.21177 seg_UAL_0.03538: 0.00779
+I:2140:17600 28/352 6/50 | Lr: 1.216e-03, 1.216e-02 | M:0.18982/C:0.19568 | [8, 1, 384, 384] | seg_BCE: 0.18834 seg_UAL_0.03604: 0.00734
+I:2160:17600 48/352 6/50 | Lr: 1.228e-03, 1.228e-02 | M:0.18784/C:0.22251 | [8, 1, 384, 384] | seg_BCE: 0.21243 seg_UAL_0.03671: 0.01009
+I:2180:17600 68/352 6/50 | Lr: 1.239e-03, 1.239e-02 | M:0.18135/C:0.17336 | [8, 1, 384, 384] | seg_BCE: 0.16598 seg_UAL_0.03738: 0.00737
+I:2200:17600 88/352 6/50 | Lr: 1.251e-03, 1.251e-02 | M:0.17707/C:0.20762 | [8, 1, 384, 384] | seg_BCE: 0.20015 seg_UAL_0.03806: 0.00747
+I:2220:17600 108/352 6/50 | Lr: 1.262e-03, 1.262e-02 | M:0.18134/C:0.16015 | [8, 1, 384, 384] | seg_BCE: 0.15165 seg_UAL_0.03875: 0.00849
+I:2240:17600 128/352 6/50 | Lr: 1.273e-03, 1.273e-02 | M:0.18329/C:0.18945 | [8, 1, 384, 384] | seg_BCE: 0.18207 seg_UAL_0.03944: 0.00738
+I:2260:17600 148/352 6/50 | Lr: 1.285e-03, 1.285e-02 | M:0.18314/C:0.19608 | [8, 1, 384, 384] | seg_BCE: 0.18858 seg_UAL_0.04014: 0.00750
+I:2280:17600 168/352 6/50 | Lr: 1.296e-03, 1.296e-02 | M:0.18190/C:0.15603 | [8, 1, 384, 384] | seg_BCE: 0.14768 seg_UAL_0.04084: 0.00835
+I:2300:17600 188/352 6/50 | Lr: 1.307e-03, 1.307e-02 | M:0.18046/C:0.13905 | [8, 1, 384, 384] | seg_BCE: 0.13090 seg_UAL_0.04155: 0.00816
+I:2320:17600 208/352 6/50 | Lr: 1.319e-03, 1.319e-02 | M:0.18052/C:0.19471 | [8, 1, 384, 384] | seg_BCE: 0.18644 seg_UAL_0.04226: 0.00827
+I:2340:17600 228/352 6/50 | Lr: 1.330e-03, 1.330e-02 | M:0.18124/C:0.26513 | [8, 1, 384, 384] | seg_BCE: 0.25599 seg_UAL_0.04299: 0.00914
+I:2360:17600 248/352 6/50 | Lr: 1.341e-03, 1.341e-02 | M:0.18104/C:0.14119 | [8, 1, 384, 384] | seg_BCE: 0.13332 seg_UAL_0.04371: 0.00787
+I:2380:17600 268/352 6/50 | Lr: 1.353e-03, 1.353e-02 | M:0.18165/C:0.19528 | [8, 1, 384, 384] | seg_BCE: 0.18620 seg_UAL_0.04445: 0.00908
+I:2400:17600 288/352 6/50 | Lr: 1.364e-03, 1.364e-02 | M:0.18289/C:0.13669 | [8, 1, 384, 384] | seg_BCE: 0.12910 seg_UAL_0.04518: 0.00759
+I:2420:17600 308/352 6/50 | Lr: 1.376e-03, 1.376e-02 | M:0.18332/C:0.08120 | [8, 1, 384, 384] | seg_BCE: 0.07516 seg_UAL_0.04593: 0.00604
+I:2440:17600 328/352 6/50 | Lr: 1.387e-03, 1.387e-02 | M:0.18347/C:0.22068 | [8, 1, 384, 384] | seg_BCE: 0.20963 seg_UAL_0.04668: 0.01105
+I:2460:17600 348/352 6/50 | Lr: 1.398e-03, 1.398e-02 | M:0.18305/C:0.16173 | [8, 1, 384, 384] | seg_BCE: 0.15283 seg_UAL_0.04743: 0.00890
+I:2463:17600 351/352 6/50 | Lr: 1.400e-03, 1.400e-02 | M:0.18324/C:0.18569 | [8, 1, 384, 384] | seg_BCE: 0.17819 seg_UAL_0.04755: 0.00750
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:2480:17600 16/352 7/50 | Lr: 1.410e-03, 1.410e-02 | M:0.15355/C:0.15390 | [8, 1, 384, 384] | seg_BCE: 0.14480 seg_UAL_0.04820: 0.00910
+I:2500:17600 36/352 7/50 | Lr: 1.421e-03, 1.421e-02 | M:0.15665/C:0.19823 | [8, 1, 384, 384] | seg_BCE: 0.18866 seg_UAL_0.04896: 0.00957
+I:2520:17600 56/352 7/50 | Lr: 1.432e-03, 1.432e-02 | M:0.15707/C:0.19430 | [8, 1, 384, 384] | seg_BCE: 0.18483 seg_UAL_0.04974: 0.00948
+I:2540:17600 76/352 7/50 | Lr: 1.444e-03, 1.444e-02 | M:0.16084/C:0.19727 | [8, 1, 384, 384] | seg_BCE: 0.18730 seg_UAL_0.05052: 0.00997
+I:2560:17600 96/352 7/50 | Lr: 1.455e-03, 1.455e-02 | M:0.16014/C:0.14038 | [8, 1, 384, 384] | seg_BCE: 0.13062 seg_UAL_0.05130: 0.00976
+I:2580:17600 116/352 7/50 | Lr: 1.466e-03, 1.466e-02 | M:0.16434/C:0.19811 | [8, 1, 384, 384] | seg_BCE: 0.18577 seg_UAL_0.05209: 0.01234
+I:2600:17600 136/352 7/50 | Lr: 1.478e-03, 1.478e-02 | M:0.16494/C:0.17546 | [8, 1, 384, 384] | seg_BCE: 0.16486 seg_UAL_0.05289: 0.01060
+I:2620:17600 156/352 7/50 | Lr: 1.489e-03, 1.489e-02 | M:0.16418/C:0.16584 | [8, 1, 384, 384] | seg_BCE: 0.15647 seg_UAL_0.05369: 0.00937
+I:2640:17600 176/352 7/50 | Lr: 1.501e-03, 1.501e-02 | M:0.16698/C:0.22071 | [8, 1, 384, 384] | seg_BCE: 0.20962 seg_UAL_0.05450: 0.01109
+I:2660:17600 196/352 7/50 | Lr: 1.512e-03, 1.512e-02 | M:0.16682/C:0.16017 | [8, 1, 384, 384] | seg_BCE: 0.14972 seg_UAL_0.05531: 0.01045
+I:2680:17600 216/352 7/50 | Lr: 1.523e-03, 1.523e-02 | M:0.16763/C:0.15462 | [8, 1, 384, 384] | seg_BCE: 0.14463 seg_UAL_0.05613: 0.00999
+I:2700:17600 236/352 7/50 | Lr: 1.535e-03, 1.535e-02 | M:0.17010/C:0.14255 | [8, 1, 384, 384] | seg_BCE: 0.13113 seg_UAL_0.05695: 0.01142
+I:2720:17600 256/352 7/50 | Lr: 1.546e-03, 1.546e-02 | M:0.16971/C:0.10974 | [8, 1, 384, 384] | seg_BCE: 0.10254 seg_UAL_0.05778: 0.00720
+I:2740:17600 276/352 7/50 | Lr: 1.557e-03, 1.557e-02 | M:0.17127/C:0.14602 | [8, 1, 384, 384] | seg_BCE: 0.13505 seg_UAL_0.05862: 0.01097
+I:2760:17600 296/352 7/50 | Lr: 1.569e-03, 1.569e-02 | M:0.17054/C:0.12344 | [8, 1, 384, 384] | seg_BCE: 0.11504 seg_UAL_0.05946: 0.00840
+I:2780:17600 316/352 7/50 | Lr: 1.580e-03, 1.580e-02 | M:0.17154/C:0.15757 | [8, 1, 384, 384] | seg_BCE: 0.14692 seg_UAL_0.06031: 0.01065
+I:2800:17600 336/352 7/50 | Lr: 1.591e-03, 1.591e-02 | M:0.17369/C:0.09344 | [8, 1, 384, 384] | seg_BCE: 0.08331 seg_UAL_0.06116: 0.01013
+I:2815:17600 351/352 7/50 | Lr: 1.600e-03, 1.600e-02 | M:0.17488/C:0.14503 | [8, 1, 384, 384] | seg_BCE: 0.13161 seg_UAL_0.06180: 0.01341
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:2820:17600 4/352 8/50 | Lr: 1.603e-03, 1.603e-02 | M:0.17414/C:0.18582 | [8, 1, 384, 384] | seg_BCE: 0.17386 seg_UAL_0.06202: 0.01196
+I:2840:17600 24/352 8/50 | Lr: 1.614e-03, 1.614e-02 | M:0.16244/C:0.17884 | [8, 1, 384, 384] | seg_BCE: 0.16666 seg_UAL_0.06288: 0.01218
+I:2860:17600 44/352 8/50 | Lr: 1.626e-03, 1.626e-02 | M:0.16497/C:0.17256 | [8, 1, 384, 384] | seg_BCE: 0.15966 seg_UAL_0.06375: 0.01290
+I:2880:17600 64/352 8/50 | Lr: 1.637e-03, 1.637e-02 | M:0.16006/C:0.12675 | [8, 1, 384, 384] | seg_BCE: 0.11760 seg_UAL_0.06463: 0.00914
+I:2900:17600 84/352 8/50 | Lr: 1.648e-03, 1.648e-02 | M:0.15854/C:0.14598 | [8, 1, 384, 384] | seg_BCE: 0.13638 seg_UAL_0.06551: 0.00959
+I:2920:17600 104/352 8/50 | Lr: 1.660e-03, 1.660e-02 | M:0.15901/C:0.24894 | [8, 1, 384, 384] | seg_BCE: 0.23677 seg_UAL_0.06639: 0.01217
+I:2940:17600 124/352 8/50 | Lr: 1.671e-03, 1.671e-02 | M:0.15862/C:0.11216 | [8, 1, 384, 384] | seg_BCE: 0.10210 seg_UAL_0.06729: 0.01006
+I:2960:17600 144/352 8/50 | Lr: 1.682e-03, 1.682e-02 | M:0.15750/C:0.10145 | [8, 1, 384, 384] | seg_BCE: 0.09220 seg_UAL_0.06818: 0.00925
+I:2980:17600 164/352 8/50 | Lr: 1.694e-03, 1.694e-02 | M:0.16240/C:0.12548 | [8, 1, 384, 384] | seg_BCE: 0.11359 seg_UAL_0.06908: 0.01189
+I:3000:17600 184/352 8/50 | Lr: 1.705e-03, 1.705e-02 | M:0.16378/C:0.25580 | [8, 1, 384, 384] | seg_BCE: 0.24260 seg_UAL_0.06999: 0.01320
+I:3020:17600 204/352 8/50 | Lr: 1.716e-03, 1.716e-02 | M:0.16683/C:0.15058 | [8, 1, 384, 384] | seg_BCE: 0.13892 seg_UAL_0.07091: 0.01166
+I:3040:17600 224/352 8/50 | Lr: 1.728e-03, 1.728e-02 | M:0.16910/C:0.11740 | [8, 1, 384, 384] | seg_BCE: 0.10621 seg_UAL_0.07183: 0.01119
+I:3060:17600 244/352 8/50 | Lr: 1.739e-03, 1.739e-02 | M:0.17031/C:0.26480 | [8, 1, 384, 384] | seg_BCE: 0.24729 seg_UAL_0.07275: 0.01751
+I:3080:17600 264/352 8/50 | Lr: 1.751e-03, 1.751e-02 | M:0.17032/C:0.13388 | [8, 1, 384, 384] | seg_BCE: 0.12305 seg_UAL_0.07368: 0.01082
+I:3100:17600 284/352 8/50 | Lr: 1.762e-03, 1.762e-02 | M:0.16907/C:0.11846 | [8, 1, 384, 384] | seg_BCE: 0.10691 seg_UAL_0.07462: 0.01155
+I:3120:17600 304/352 8/50 | Lr: 1.773e-03, 1.773e-02 | M:0.16762/C:0.18603 | [8, 1, 384, 384] | seg_BCE: 0.17188 seg_UAL_0.07556: 0.01415
+I:3140:17600 324/352 8/50 | Lr: 1.785e-03, 1.785e-02 | M:0.16640/C:0.15720 | [8, 1, 384, 384] | seg_BCE: 0.14808 seg_UAL_0.07650: 0.00912
+I:3160:17600 344/352 8/50 | Lr: 1.796e-03, 1.796e-02 | M:0.16639/C:0.14423 | [8, 1, 384, 384] | seg_BCE: 0.13135 seg_UAL_0.07745: 0.01287
+I:3167:17600 351/352 8/50 | Lr: 1.800e-03, 1.800e-02 | M:0.16617/C:0.20988 | [8, 1, 384, 384] | seg_BCE: 0.19540 seg_UAL_0.07779: 0.01448
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:3180:17600 12/352 9/50 | Lr: 1.807e-03, 1.807e-02 | M:0.15416/C:0.19805 | [8, 1, 384, 384] | seg_BCE: 0.18311 seg_UAL_0.07841: 0.01494
+I:3200:17600 32/352 9/50 | Lr: 1.819e-03, 1.819e-02 | M:0.15437/C:0.12723 | [8, 1, 384, 384] | seg_BCE: 0.11690 seg_UAL_0.07937: 0.01033
+I:3220:17600 52/352 9/50 | Lr: 1.830e-03, 1.830e-02 | M:0.15279/C:0.15989 | [8, 1, 384, 384] | seg_BCE: 0.14680 seg_UAL_0.08034: 0.01308
+I:3240:17600 72/352 9/50 | Lr: 1.841e-03, 1.841e-02 | M:0.14675/C:0.10965 | [8, 1, 384, 384] | seg_BCE: 0.09959 seg_UAL_0.08131: 0.01005
+I:3260:17600 92/352 9/50 | Lr: 1.853e-03, 1.853e-02 | M:0.15486/C:0.24519 | [8, 1, 384, 384] | seg_BCE: 0.22857 seg_UAL_0.08229: 0.01661
+I:3280:17600 112/352 9/50 | Lr: 1.864e-03, 1.864e-02 | M:0.16253/C:0.18627 | [8, 1, 384, 384] | seg_BCE: 0.16753 seg_UAL_0.08328: 0.01874
+I:3300:17600 132/352 9/50 | Lr: 1.876e-03, 1.876e-02 | M:0.16586/C:0.21312 | [8, 1, 384, 384] | seg_BCE: 0.19719 seg_UAL_0.08427: 0.01593
+I:3320:17600 152/352 9/50 | Lr: 1.887e-03, 1.887e-02 | M:0.16413/C:0.07907 | [8, 1, 384, 384] | seg_BCE: 0.06951 seg_UAL_0.08526: 0.00957
+I:3340:17600 172/352 9/50 | Lr: 1.898e-03, 1.898e-02 | M:0.16731/C:0.14791 | [8, 1, 384, 384] | seg_BCE: 0.13217 seg_UAL_0.08626: 0.01574
+I:3360:17600 192/352 9/50 | Lr: 1.910e-03, 1.910e-02 | M:0.16680/C:0.12761 | [8, 1, 384, 384] | seg_BCE: 0.11465 seg_UAL_0.08726: 0.01297
+I:3380:17600 212/352 9/50 | Lr: 1.921e-03, 1.921e-02 | M:0.16554/C:0.16255 | [8, 1, 384, 384] | seg_BCE: 0.14918 seg_UAL_0.08827: 0.01337
+I:3400:17600 232/352 9/50 | Lr: 1.932e-03, 1.932e-02 | M:0.16646/C:0.15183 | [8, 1, 384, 384] | seg_BCE: 0.13575 seg_UAL_0.08929: 0.01608
+I:3420:17600 252/352 9/50 | Lr: 1.944e-03, 1.944e-02 | M:0.16829/C:0.17457 | [8, 1, 384, 384] | seg_BCE: 0.15526 seg_UAL_0.09031: 0.01931
+I:3440:17600 272/352 9/50 | Lr: 1.955e-03, 1.955e-02 | M:0.16887/C:0.22635 | [8, 1, 384, 384] | seg_BCE: 0.20953 seg_UAL_0.09134: 0.01682
+I:3460:17600 292/352 9/50 | Lr: 1.966e-03, 1.966e-02 | M:0.17031/C:0.37793 | [8, 1, 384, 384] | seg_BCE: 0.36277 seg_UAL_0.09237: 0.01516
+I:3480:17600 312/352 9/50 | Lr: 1.978e-03, 1.978e-02 | M:0.17011/C:0.13743 | [8, 1, 384, 384] | seg_BCE: 0.12186 seg_UAL_0.09340: 0.01557
+I:3500:17600 332/352 9/50 | Lr: 1.989e-03, 1.989e-02 | M:0.16888/C:0.20490 | [8, 1, 384, 384] | seg_BCE: 0.19132 seg_UAL_0.09444: 0.01358
+I:3519:17600 351/352 9/50 | Lr: 2.000e-03, 2.000e-02 | M:0.16839/C:0.15163 | [8, 1, 384, 384] | seg_BCE: 0.13629 seg_UAL_0.09544: 0.01535
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:3520:17600 0/352 10/50 | Lr: 2.001e-03, 2.001e-02 | M:0.24627/C:0.24627 | [8, 1, 384, 384] | seg_BCE: 0.22755 seg_UAL_0.09549: 0.01872
+I:3540:17600 20/352 10/50 | Lr: 2.012e-03, 2.012e-02 | M:0.15723/C:0.24583 | [8, 1, 384, 384] | seg_BCE: 0.23009 seg_UAL_0.09654: 0.01573
+I:3560:17600 40/352 10/50 | Lr: 2.023e-03, 2.023e-02 | M:0.15894/C:0.08084 | [8, 1, 384, 384] | seg_BCE: 0.06740 seg_UAL_0.09760: 0.01343
+I:3580:17600 60/352 10/50 | Lr: 2.035e-03, 2.035e-02 | M:0.15750/C:0.18179 | [8, 1, 384, 384] | seg_BCE: 0.16692 seg_UAL_0.09866: 0.01487
+I:3600:17600 80/352 10/50 | Lr: 2.046e-03, 2.046e-02 | M:0.15565/C:0.09985 | [8, 1, 384, 384] | seg_BCE: 0.08706 seg_UAL_0.09973: 0.01279
+I:3620:17600 100/352 10/50 | Lr: 2.057e-03, 2.057e-02 | M:0.14932/C:0.11901 | [8, 1, 384, 384] | seg_BCE: 0.10596 seg_UAL_0.10080: 0.01305
+I:3640:17600 120/352 10/50 | Lr: 2.069e-03, 2.069e-02 | M:0.14870/C:0.09850 | [8, 1, 384, 384] | seg_BCE: 0.08782 seg_UAL_0.10188: 0.01068
+I:3660:17600 140/352 10/50 | Lr: 2.080e-03, 2.080e-02 | M:0.14740/C:0.10881 | [8, 1, 384, 384] | seg_BCE: 0.09398 seg_UAL_0.10296: 0.01483
+I:3680:17600 160/352 10/50 | Lr: 2.091e-03, 2.091e-02 | M:0.14626/C:0.10277 | [8, 1, 384, 384] | seg_BCE: 0.08996 seg_UAL_0.10405: 0.01280
+I:3700:17600 180/352 10/50 | Lr: 2.103e-03, 2.103e-02 | M:0.14808/C:0.12043 | [8, 1, 384, 384] | seg_BCE: 0.10581 seg_UAL_0.10514: 0.01462
+I:3720:17600 200/352 10/50 | Lr: 2.114e-03, 2.114e-02 | M:0.15128/C:0.09395 | [8, 1, 384, 384] | seg_BCE: 0.07950 seg_UAL_0.10624: 0.01444
+I:3740:17600 220/352 10/50 | Lr: 2.126e-03, 2.126e-02 | M:0.15051/C:0.17912 | [8, 1, 384, 384] | seg_BCE: 0.16391 seg_UAL_0.10734: 0.01521
+I:3760:17600 240/352 10/50 | Lr: 2.137e-03, 2.137e-02 | M:0.14901/C:0.11391 | [8, 1, 384, 384] | seg_BCE: 0.10187 seg_UAL_0.10845: 0.01205
+I:3780:17600 260/352 10/50 | Lr: 2.148e-03, 2.148e-02 | M:0.14964/C:0.11375 | [8, 1, 384, 384] | seg_BCE: 0.10036 seg_UAL_0.10956: 0.01339
+I:3800:17600 280/352 10/50 | Lr: 2.160e-03, 2.160e-02 | M:0.14939/C:0.14214 | [8, 1, 384, 384] | seg_BCE: 0.12449 seg_UAL_0.11068: 0.01766
+I:3820:17600 300/352 10/50 | Lr: 2.171e-03, 2.171e-02 | M:0.15093/C:0.21295 | [8, 1, 384, 384] | seg_BCE: 0.19567 seg_UAL_0.11180: 0.01728
+I:3840:17600 320/352 10/50 | Lr: 2.182e-03, 2.182e-02 | M:0.15378/C:0.17038 | [8, 1, 384, 384] | seg_BCE: 0.14722 seg_UAL_0.11293: 0.02316
+I:3860:17600 340/352 10/50 | Lr: 2.194e-03, 2.194e-02 | M:0.15539/C:0.14213 | [8, 1, 384, 384] | seg_BCE: 0.12602 seg_UAL_0.11406: 0.01611
+I:3871:17600 351/352 10/50 | Lr: 2.200e-03, 2.200e-02 | M:0.15551/C:0.13152 | [8, 1, 384, 384] | seg_BCE: 0.11707 seg_UAL_0.11469: 0.01446
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:3880:17600 8/352 11/50 | Lr: 2.205e-03, 2.205e-02 | M:0.19277/C:0.23416 | [8, 1, 384, 384] | seg_BCE: 0.21219 seg_UAL_0.11520: 0.02197
+I:3900:17600 28/352 11/50 | Lr: 2.216e-03, 2.216e-02 | M:0.17101/C:0.14216 | [8, 1, 384, 384] | seg_BCE: 0.12512 seg_UAL_0.11634: 0.01704
+I:3920:17600 48/352 11/50 | Lr: 2.228e-03, 2.228e-02 | M:0.17344/C:0.23257 | [8, 1, 384, 384] | seg_BCE: 0.21221 seg_UAL_0.11749: 0.02036
+I:3940:17600 68/352 11/50 | Lr: 2.239e-03, 2.239e-02 | M:0.16363/C:0.14175 | [8, 1, 384, 384] | seg_BCE: 0.12243 seg_UAL_0.11864: 0.01932
+I:3960:17600 88/352 11/50 | Lr: 2.251e-03, 2.251e-02 | M:0.16063/C:0.17491 | [8, 1, 384, 384] | seg_BCE: 0.15831 seg_UAL_0.11980: 0.01659
+I:3980:17600 108/352 11/50 | Lr: 2.262e-03, 2.262e-02 | M:0.16104/C:0.15587 | [8, 1, 384, 384] | seg_BCE: 0.13433 seg_UAL_0.12096: 0.02154
+I:4000:17600 128/352 11/50 | Lr: 2.273e-03, 2.273e-02 | M:0.16573/C:0.17709 | [8, 1, 384, 384] | seg_BCE: 0.15865 seg_UAL_0.12213: 0.01844
+I:4020:17600 148/352 11/50 | Lr: 2.285e-03, 2.285e-02 | M:0.16697/C:0.12003 | [8, 1, 384, 384] | seg_BCE: 0.10195 seg_UAL_0.12330: 0.01808
+I:4040:17600 168/352 11/50 | Lr: 2.296e-03, 2.296e-02 | M:0.16423/C:0.12185 | [8, 1, 384, 384] | seg_BCE: 0.10352 seg_UAL_0.12447: 0.01832
+I:4060:17600 188/352 11/50 | Lr: 2.307e-03, 2.307e-02 | M:0.16252/C:0.17849 | [8, 1, 384, 384] | seg_BCE: 0.16103 seg_UAL_0.12565: 0.01745
+I:4080:17600 208/352 11/50 | Lr: 2.319e-03, 2.319e-02 | M:0.16115/C:0.16132 | [8, 1, 384, 384] | seg_BCE: 0.14247 seg_UAL_0.12684: 0.01885
+I:4100:17600 228/352 11/50 | Lr: 2.330e-03, 2.330e-02 | M:0.16071/C:0.13682 | [8, 1, 384, 384] | seg_BCE: 0.11486 seg_UAL_0.12803: 0.02195
+I:4120:17600 248/352 11/50 | Lr: 2.341e-03, 2.341e-02 | M:0.16002/C:0.12855 | [8, 1, 384, 384] | seg_BCE: 0.11281 seg_UAL_0.12922: 0.01574
+I:4140:17600 268/352 11/50 | Lr: 2.353e-03, 2.353e-02 | M:0.16131/C:0.22754 | [8, 1, 384, 384] | seg_BCE: 0.20881 seg_UAL_0.13042: 0.01873
+I:4160:17600 288/352 11/50 | Lr: 2.364e-03, 2.364e-02 | M:0.16306/C:0.15622 | [8, 1, 384, 384] | seg_BCE: 0.13570 seg_UAL_0.13163: 0.02052
+I:4180:17600 308/352 11/50 | Lr: 2.376e-03, 2.376e-02 | M:0.16288/C:0.13860 | [8, 1, 384, 384] | seg_BCE: 0.11566 seg_UAL_0.13284: 0.02294
+I:4200:17600 328/352 11/50 | Lr: 2.387e-03, 2.387e-02 | M:0.16288/C:0.11304 | [8, 1, 384, 384] | seg_BCE: 0.09688 seg_UAL_0.13405: 0.01616
+I:4220:17600 348/352 11/50 | Lr: 2.398e-03, 2.398e-02 | M:0.16363/C:0.23874 | [8, 1, 384, 384] | seg_BCE: 0.21348 seg_UAL_0.13527: 0.02526
+I:4223:17600 351/352 11/50 | Lr: 2.400e-03, 2.400e-02 | M:0.16351/C:0.16779 | [8, 1, 384, 384] | seg_BCE: 0.14488 seg_UAL_0.13545: 0.02291
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:4240:17600 16/352 12/50 | Lr: 2.410e-03, 2.410e-02 | M:0.14618/C:0.15232 | [8, 1, 384, 384] | seg_BCE: 0.13099 seg_UAL_0.13649: 0.02134
+I:4260:17600 36/352 12/50 | Lr: 2.421e-03, 2.421e-02 | M:0.15795/C:0.16691 | [8, 1, 384, 384] | seg_BCE: 0.14745 seg_UAL_0.13772: 0.01945
+I:4280:17600 56/352 12/50 | Lr: 2.432e-03, 2.432e-02 | M:0.15337/C:0.14314 | [8, 1, 384, 384] | seg_BCE: 0.12680 seg_UAL_0.13896: 0.01633
+I:4300:17600 76/352 12/50 | Lr: 2.444e-03, 2.444e-02 | M:0.14799/C:0.09891 | [8, 1, 384, 384] | seg_BCE: 0.08328 seg_UAL_0.14019: 0.01563
+I:4320:17600 96/352 12/50 | Lr: 2.455e-03, 2.455e-02 | M:0.14534/C:0.14303 | [8, 1, 384, 384] | seg_BCE: 0.12689 seg_UAL_0.14143: 0.01614
+I:4340:17600 116/352 12/50 | Lr: 2.466e-03, 2.466e-02 | M:0.14855/C:0.25258 | [8, 1, 384, 384] | seg_BCE: 0.23094 seg_UAL_0.14268: 0.02164
+I:4360:17600 136/352 12/50 | Lr: 2.478e-03, 2.478e-02 | M:0.15099/C:0.12773 | [8, 1, 384, 384] | seg_BCE: 0.10728 seg_UAL_0.14393: 0.02045
+I:4380:17600 156/352 12/50 | Lr: 2.489e-03, 2.489e-02 | M:0.15176/C:0.12341 | [8, 1, 384, 384] | seg_BCE: 0.10182 seg_UAL_0.14519: 0.02159
+I:4400:17600 176/352 12/50 | Lr: 2.501e-03, 2.501e-02 | M:0.15266/C:0.16165 | [8, 1, 384, 384] | seg_BCE: 0.14091 seg_UAL_0.14645: 0.02074
+I:4420:17600 196/352 12/50 | Lr: 2.512e-03, 2.512e-02 | M:0.15226/C:0.07757 | [8, 1, 384, 384] | seg_BCE: 0.06356 seg_UAL_0.14771: 0.01401
+I:4440:17600 216/352 12/50 | Lr: 2.523e-03, 2.523e-02 | M:0.15319/C:0.19101 | [8, 1, 384, 384] | seg_BCE: 0.16899 seg_UAL_0.14898: 0.02203
+I:4460:17600 236/352 12/50 | Lr: 2.535e-03, 2.535e-02 | M:0.15366/C:0.15846 | [8, 1, 384, 384] | seg_BCE: 0.13525 seg_UAL_0.15025: 0.02321
+I:4480:17600 256/352 12/50 | Lr: 2.546e-03, 2.546e-02 | M:0.15472/C:0.17254 | [8, 1, 384, 384] | seg_BCE: 0.14770 seg_UAL_0.15153: 0.02484
+I:4500:17600 276/352 12/50 | Lr: 2.557e-03, 2.557e-02 | M:0.15461/C:0.12649 | [8, 1, 384, 384] | seg_BCE: 0.11188 seg_UAL_0.15281: 0.01461
+I:4520:17600 296/352 12/50 | Lr: 2.569e-03, 2.569e-02 | M:0.15428/C:0.16586 | [8, 1, 384, 384] | seg_BCE: 0.14712 seg_UAL_0.15410: 0.01874
+I:4540:17600 316/352 12/50 | Lr: 2.580e-03, 2.580e-02 | M:0.15435/C:0.22957 | [8, 1, 384, 384] | seg_BCE: 0.20703 seg_UAL_0.15539: 0.02254
+I:4560:17600 336/352 12/50 | Lr: 2.591e-03, 2.591e-02 | M:0.15394/C:0.11494 | [8, 1, 384, 384] | seg_BCE: 0.10070 seg_UAL_0.15669: 0.01424
+I:4575:17600 351/352 12/50 | Lr: 2.600e-03, 2.600e-02 | M:0.15310/C:0.18401 | [8, 1, 384, 384] | seg_BCE: 0.16264 seg_UAL_0.15766: 0.02137
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:4580:17600 4/352 13/50 | Lr: 2.603e-03, 2.603e-02 | M:0.12525/C:0.09676 | [8, 1, 384, 384] | seg_BCE: 0.08124 seg_UAL_0.15799: 0.01551
+I:4600:17600 24/352 13/50 | Lr: 2.614e-03, 2.614e-02 | M:0.12991/C:0.09317 | [8, 1, 384, 384] | seg_BCE: 0.07508 seg_UAL_0.15929: 0.01809
+I:4620:17600 44/352 13/50 | Lr: 2.626e-03, 2.626e-02 | M:0.14570/C:0.23393 | [8, 1, 384, 384] | seg_BCE: 0.20984 seg_UAL_0.16060: 0.02409
+I:4640:17600 64/352 13/50 | Lr: 2.637e-03, 2.637e-02 | M:0.14025/C:0.17120 | [8, 1, 384, 384] | seg_BCE: 0.15169 seg_UAL_0.16191: 0.01951
+I:4660:17600 84/352 13/50 | Lr: 2.648e-03, 2.648e-02 | M:0.13467/C:0.07853 | [8, 1, 384, 384] | seg_BCE: 0.06254 seg_UAL_0.16323: 0.01599
+I:4680:17600 104/352 13/50 | Lr: 2.660e-03, 2.660e-02 | M:0.13440/C:0.14016 | [8, 1, 384, 384] | seg_BCE: 0.12292 seg_UAL_0.16455: 0.01725
+I:4700:17600 124/352 13/50 | Lr: 2.671e-03, 2.671e-02 | M:0.13543/C:0.10092 | [8, 1, 384, 384] | seg_BCE: 0.08444 seg_UAL_0.16588: 0.01648
+I:4720:17600 144/352 13/50 | Lr: 2.682e-03, 2.682e-02 | M:0.13377/C:0.10541 | [8, 1, 384, 384] | seg_BCE: 0.08533 seg_UAL_0.16721: 0.02008
+I:4740:17600 164/352 13/50 | Lr: 2.694e-03, 2.694e-02 | M:0.13487/C:0.23488 | [8, 1, 384, 384] | seg_BCE: 0.21145 seg_UAL_0.16854: 0.02343
+I:4760:17600 184/352 13/50 | Lr: 2.705e-03, 2.705e-02 | M:0.13549/C:0.33409 | [8, 1, 384, 384] | seg_BCE: 0.31228 seg_UAL_0.16988: 0.02181
+I:4780:17600 204/352 13/50 | Lr: 2.716e-03, 2.716e-02 | M:0.13970/C:0.18438 | [8, 1, 384, 384] | seg_BCE: 0.15929 seg_UAL_0.17122: 0.02509
+I:4800:17600 224/352 13/50 | Lr: 2.728e-03, 2.728e-02 | M:0.14002/C:0.17783 | [8, 1, 384, 384] | seg_BCE: 0.15797 seg_UAL_0.17257: 0.01985
+I:4820:17600 244/352 13/50 | Lr: 2.739e-03, 2.739e-02 | M:0.14329/C:0.20070 | [8, 1, 384, 384] | seg_BCE: 0.17455 seg_UAL_0.17392: 0.02615
+I:4840:17600 264/352 13/50 | Lr: 2.751e-03, 2.751e-02 | M:0.14661/C:0.23518 | [8, 1, 384, 384] | seg_BCE: 0.20761 seg_UAL_0.17528: 0.02757
+I:4860:17600 284/352 13/50 | Lr: 2.762e-03, 2.762e-02 | M:0.14757/C:0.12457 | [8, 1, 384, 384] | seg_BCE: 0.10328 seg_UAL_0.17664: 0.02129
+I:4880:17600 304/352 13/50 | Lr: 2.773e-03, 2.773e-02 | M:0.14871/C:0.16362 | [8, 1, 384, 384] | seg_BCE: 0.13880 seg_UAL_0.17800: 0.02482
+I:4900:17600 324/352 13/50 | Lr: 2.785e-03, 2.785e-02 | M:0.14963/C:0.12476 | [8, 1, 384, 384] | seg_BCE: 0.10203 seg_UAL_0.17937: 0.02273
+I:4920:17600 344/352 13/50 | Lr: 2.796e-03, 2.796e-02 | M:0.15020/C:0.14759 | [8, 1, 384, 384] | seg_BCE: 0.12764 seg_UAL_0.18074: 0.01995
+I:4927:17600 351/352 13/50 | Lr: 2.800e-03, 2.800e-02 | M:0.14995/C:0.14198 | [8, 1, 384, 384] | seg_BCE: 0.11946 seg_UAL_0.18122: 0.02251
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:4940:17600 12/352 14/50 | Lr: 2.807e-03, 2.807e-02 | M:0.16036/C:0.12713 | [8, 1, 384, 384] | seg_BCE: 0.10640 seg_UAL_0.18211: 0.02073
+I:4960:17600 32/352 14/50 | Lr: 2.819e-03, 2.819e-02 | M:0.15948/C:0.12149 | [8, 1, 384, 384] | seg_BCE: 0.09682 seg_UAL_0.18349: 0.02466
+I:4980:17600 52/352 14/50 | Lr: 2.830e-03, 2.830e-02 | M:0.15116/C:0.14368 | [8, 1, 384, 384] | seg_BCE: 0.12322 seg_UAL_0.18488: 0.02047
+I:5000:17600 72/352 14/50 | Lr: 2.841e-03, 2.841e-02 | M:0.15150/C:0.17410 | [8, 1, 384, 384] | seg_BCE: 0.14794 seg_UAL_0.18627: 0.02617
+I:5020:17600 92/352 14/50 | Lr: 2.853e-03, 2.853e-02 | M:0.14910/C:0.20184 | [8, 1, 384, 384] | seg_BCE: 0.18054 seg_UAL_0.18766: 0.02131
+I:5040:17600 112/352 14/50 | Lr: 2.864e-03, 2.864e-02 | M:0.14929/C:0.09932 | [8, 1, 384, 384] | seg_BCE: 0.07838 seg_UAL_0.18905: 0.02094
+I:5060:17600 132/352 14/50 | Lr: 2.876e-03, 2.876e-02 | M:0.14976/C:0.15280 | [8, 1, 384, 384] | seg_BCE: 0.13230 seg_UAL_0.19045: 0.02050
+I:5080:17600 152/352 14/50 | Lr: 2.887e-03, 2.887e-02 | M:0.15232/C:0.14721 | [8, 1, 384, 384] | seg_BCE: 0.12524 seg_UAL_0.19186: 0.02196
+I:5100:17600 172/352 14/50 | Lr: 2.898e-03, 2.898e-02 | M:0.15387/C:0.16185 | [8, 1, 384, 384] | seg_BCE: 0.13848 seg_UAL_0.19326: 0.02337
+I:5120:17600 192/352 14/50 | Lr: 2.910e-03, 2.910e-02 | M:0.15469/C:0.19538 | [8, 1, 384, 384] | seg_BCE: 0.17144 seg_UAL_0.19468: 0.02394
+I:5140:17600 212/352 14/50 | Lr: 2.921e-03, 2.921e-02 | M:0.15569/C:0.19713 | [8, 1, 384, 384] | seg_BCE: 0.16590 seg_UAL_0.19609: 0.03123
+I:5160:17600 232/352 14/50 | Lr: 2.932e-03, 2.932e-02 | M:0.15681/C:0.28973 | [8, 1, 384, 384] | seg_BCE: 0.25507 seg_UAL_0.19751: 0.03466
+I:5180:17600 252/352 14/50 | Lr: 2.944e-03, 2.944e-02 | M:0.15593/C:0.15993 | [8, 1, 384, 384] | seg_BCE: 0.13890 seg_UAL_0.19893: 0.02103
+I:5200:17600 272/352 14/50 | Lr: 2.955e-03, 2.955e-02 | M:0.15652/C:0.10424 | [8, 1, 384, 384] | seg_BCE: 0.08286 seg_UAL_0.20036: 0.02138
+I:5220:17600 292/352 14/50 | Lr: 2.966e-03, 2.966e-02 | M:0.15635/C:0.16883 | [8, 1, 384, 384] | seg_BCE: 0.14711 seg_UAL_0.20179: 0.02172
+I:5240:17600 312/352 14/50 | Lr: 2.978e-03, 2.978e-02 | M:0.15724/C:0.15681 | [8, 1, 384, 384] | seg_BCE: 0.12751 seg_UAL_0.20323: 0.02929
+I:5260:17600 332/352 14/50 | Lr: 2.989e-03, 2.989e-02 | M:0.16004/C:0.15497 | [8, 1, 384, 384] | seg_BCE: 0.12442 seg_UAL_0.20467: 0.03055
+I:5279:17600 351/352 14/50 | Lr: 3.000e-03, 3.000e-02 | M:0.16338/C:0.19431 | [8, 1, 384, 384] | seg_BCE: 0.16320 seg_UAL_0.20604: 0.03110
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:5280:17600 0/352 15/50 | Lr: 3.001e-03, 3.001e-02 | M:0.17954/C:0.17954 | [8, 1, 384, 384] | seg_BCE: 0.14956 seg_UAL_0.20611: 0.02998
+I:5300:17600 20/352 15/50 | Lr: 3.012e-03, 3.012e-02 | M:0.17553/C:0.30968 | [8, 1, 384, 384] | seg_BCE: 0.27350 seg_UAL_0.20755: 0.03618
+I:5320:17600 40/352 15/50 | Lr: 3.023e-03, 3.023e-02 | M:0.16458/C:0.16810 | [8, 1, 384, 384] | seg_BCE: 0.14619 seg_UAL_0.20900: 0.02191
+I:5340:17600 60/352 15/50 | Lr: 3.035e-03, 3.035e-02 | M:0.16326/C:0.20185 | [8, 1, 384, 384] | seg_BCE: 0.17196 seg_UAL_0.21046: 0.02989
+I:5360:17600 80/352 15/50 | Lr: 3.046e-03, 3.046e-02 | M:0.16131/C:0.27276 | [8, 1, 384, 384] | seg_BCE: 0.24631 seg_UAL_0.21191: 0.02646
+I:5380:17600 100/352 15/50 | Lr: 3.057e-03, 3.057e-02 | M:0.15821/C:0.21609 | [8, 1, 384, 384] | seg_BCE: 0.18803 seg_UAL_0.21337: 0.02806
+I:5400:17600 120/352 15/50 | Lr: 3.069e-03, 3.069e-02 | M:0.15154/C:0.12984 | [8, 1, 384, 384] | seg_BCE: 0.11081 seg_UAL_0.21484: 0.01904
+I:5420:17600 140/352 15/50 | Lr: 3.080e-03, 3.080e-02 | M:0.15341/C:0.12750 | [8, 1, 384, 384] | seg_BCE: 0.10464 seg_UAL_0.21631: 0.02286
+I:5440:17600 160/352 15/50 | Lr: 3.091e-03, 3.091e-02 | M:0.15759/C:0.24305 | [8, 1, 384, 384] | seg_BCE: 0.19402 seg_UAL_0.21778: 0.04902
+I:5460:17600 180/352 15/50 | Lr: 3.103e-03, 3.103e-02 | M:0.15744/C:0.28751 | [8, 1, 384, 384] | seg_BCE: 0.25868 seg_UAL_0.21925: 0.02883
+I:5480:17600 200/352 15/50 | Lr: 3.114e-03, 3.114e-02 | M:0.15803/C:0.13756 | [8, 1, 384, 384] | seg_BCE: 0.11723 seg_UAL_0.22073: 0.02033
+I:5500:17600 220/352 15/50 | Lr: 3.126e-03, 3.126e-02 | M:0.15719/C:0.19713 | [8, 1, 384, 384] | seg_BCE: 0.17310 seg_UAL_0.22221: 0.02403
+I:5520:17600 240/352 15/50 | Lr: 3.137e-03, 3.137e-02 | M:0.15661/C:0.10318 | [8, 1, 384, 384] | seg_BCE: 0.08292 seg_UAL_0.22370: 0.02026
+I:5540:17600 260/352 15/50 | Lr: 3.148e-03, 3.148e-02 | M:0.15695/C:0.11625 | [8, 1, 384, 384] | seg_BCE: 0.09026 seg_UAL_0.22519: 0.02599
+I:5560:17600 280/352 15/50 | Lr: 3.160e-03, 3.160e-02 | M:0.15649/C:0.11674 | [8, 1, 384, 384] | seg_BCE: 0.09626 seg_UAL_0.22668: 0.02047
+I:5580:17600 300/352 15/50 | Lr: 3.171e-03, 3.171e-02 | M:0.15664/C:0.09595 | [8, 1, 384, 384] | seg_BCE: 0.07157 seg_UAL_0.22818: 0.02439
+I:5600:17600 320/352 15/50 | Lr: 3.182e-03, 3.182e-02 | M:0.15616/C:0.09380 | [8, 1, 384, 384] | seg_BCE: 0.07493 seg_UAL_0.22968: 0.01886
+I:5620:17600 340/352 15/50 | Lr: 3.194e-03, 3.194e-02 | M:0.15694/C:0.30272 | [8, 1, 384, 384] | seg_BCE: 0.26349 seg_UAL_0.23118: 0.03923
+I:5631:17600 351/352 15/50 | Lr: 3.200e-03, 3.200e-02 | M:0.15694/C:0.21075 | [8, 1, 384, 384] | seg_BCE: 0.17903 seg_UAL_0.23201: 0.03171
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:5640:17600 8/352 16/50 | Lr: 3.205e-03, 3.205e-02 | M:0.14113/C:0.19539 | [8, 1, 384, 384] | seg_BCE: 0.16332 seg_UAL_0.23269: 0.03207
+I:5660:17600 28/352 16/50 | Lr: 3.216e-03, 3.216e-02 | M:0.14424/C:0.21221 | [8, 1, 384, 384] | seg_BCE: 0.17429 seg_UAL_0.23420: 0.03792
+I:5680:17600 48/352 16/50 | Lr: 3.228e-03, 3.228e-02 | M:0.15030/C:0.18213 | [8, 1, 384, 384] | seg_BCE: 0.14998 seg_UAL_0.23571: 0.03215
+I:5700:17600 68/352 16/50 | Lr: 3.239e-03, 3.239e-02 | M:0.14758/C:0.23818 | [8, 1, 384, 384] | seg_BCE: 0.20955 seg_UAL_0.23723: 0.02863
+I:5720:17600 88/352 16/50 | Lr: 3.251e-03, 3.251e-02 | M:0.14681/C:0.08833 | [8, 1, 384, 384] | seg_BCE: 0.06861 seg_UAL_0.23875: 0.01972
+I:5740:17600 108/352 16/50 | Lr: 3.262e-03, 3.262e-02 | M:0.14942/C:0.12840 | [8, 1, 384, 384] | seg_BCE: 0.10244 seg_UAL_0.24027: 0.02595
+I:5760:17600 128/352 16/50 | Lr: 3.273e-03, 3.273e-02 | M:0.14665/C:0.11830 | [8, 1, 384, 384] | seg_BCE: 0.09225 seg_UAL_0.24180: 0.02605
+I:5780:17600 148/352 16/50 | Lr: 3.285e-03, 3.285e-02 | M:0.14145/C:0.12058 | [8, 1, 384, 384] | seg_BCE: 0.09926 seg_UAL_0.24333: 0.02132
+I:5800:17600 168/352 16/50 | Lr: 3.296e-03, 3.296e-02 | M:0.14066/C:0.14904 | [8, 1, 384, 384] | seg_BCE: 0.12371 seg_UAL_0.24486: 0.02532
+I:5820:17600 188/352 16/50 | Lr: 3.307e-03, 3.307e-02 | M:0.14077/C:0.09659 | [8, 1, 384, 384] | seg_BCE: 0.07753 seg_UAL_0.24640: 0.01906
+I:5840:17600 208/352 16/50 | Lr: 3.319e-03, 3.319e-02 | M:0.14113/C:0.13862 | [8, 1, 384, 384] | seg_BCE: 0.11268 seg_UAL_0.24794: 0.02593
+I:5860:17600 228/352 16/50 | Lr: 3.330e-03, 3.330e-02 | M:0.14102/C:0.09937 | [8, 1, 384, 384] | seg_BCE: 0.07409 seg_UAL_0.24948: 0.02528
+I:5880:17600 248/352 16/50 | Lr: 3.341e-03, 3.341e-02 | M:0.14135/C:0.25509 | [8, 1, 384, 384] | seg_BCE: 0.21903 seg_UAL_0.25103: 0.03606
+I:5900:17600 268/352 16/50 | Lr: 3.353e-03, 3.353e-02 | M:0.14309/C:0.18572 | [8, 1, 384, 384] | seg_BCE: 0.14628 seg_UAL_0.25258: 0.03944
+I:5920:17600 288/352 16/50 | Lr: 3.364e-03, 3.364e-02 | M:0.14446/C:0.12600 | [8, 1, 384, 384] | seg_BCE: 0.10343 seg_UAL_0.25413: 0.02257
+I:5940:17600 308/352 16/50 | Lr: 3.376e-03, 3.376e-02 | M:0.14534/C:0.18472 | [8, 1, 384, 384] | seg_BCE: 0.16082 seg_UAL_0.25569: 0.02389
+I:5960:17600 328/352 16/50 | Lr: 3.387e-03, 3.387e-02 | M:0.14581/C:0.29714 | [8, 1, 384, 384] | seg_BCE: 0.26962 seg_UAL_0.25725: 0.02752
+I:5980:17600 348/352 16/50 | Lr: 3.398e-03, 3.398e-02 | M:0.14687/C:0.22318 | [8, 1, 384, 384] | seg_BCE: 0.19830 seg_UAL_0.25881: 0.02488
+I:5983:17600 351/352 16/50 | Lr: 3.400e-03, 3.400e-02 | M:0.14744/C:0.33540 | [8, 1, 384, 384] | seg_BCE: 0.29815 seg_UAL_0.25904: 0.03725
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:6000:17600 16/352 17/50 | Lr: 3.410e-03, 3.410e-02 | M:0.13572/C:0.16370 | [8, 1, 384, 384] | seg_BCE: 0.13232 seg_UAL_0.26038: 0.03137
+I:6020:17600 36/352 17/50 | Lr: 3.421e-03, 3.421e-02 | M:0.14857/C:0.18457 | [8, 1, 384, 384] | seg_BCE: 0.14815 seg_UAL_0.26194: 0.03642
+I:6040:17600 56/352 17/50 | Lr: 3.432e-03, 3.432e-02 | M:0.14973/C:0.18648 | [8, 1, 384, 384] | seg_BCE: 0.16338 seg_UAL_0.26351: 0.02310
+I:6060:17600 76/352 17/50 | Lr: 3.444e-03, 3.444e-02 | M:0.15375/C:0.21071 | [8, 1, 384, 384] | seg_BCE: 0.17435 seg_UAL_0.26509: 0.03636
+I:6080:17600 96/352 17/50 | Lr: 3.455e-03, 3.455e-02 | M:0.15330/C:0.09812 | [8, 1, 384, 384] | seg_BCE: 0.07602 seg_UAL_0.26667: 0.02210
+I:6100:17600 116/352 17/50 | Lr: 3.466e-03, 3.466e-02 | M:0.15098/C:0.10707 | [8, 1, 384, 384] | seg_BCE: 0.08144 seg_UAL_0.26825: 0.02563
+I:6120:17600 136/352 17/50 | Lr: 3.478e-03, 3.478e-02 | M:0.15134/C:0.14243 | [8, 1, 384, 384] | seg_BCE: 0.11264 seg_UAL_0.26983: 0.02980
+I:6140:17600 156/352 17/50 | Lr: 3.489e-03, 3.489e-02 | M:0.14906/C:0.10180 | [8, 1, 384, 384] | seg_BCE: 0.07800 seg_UAL_0.27142: 0.02379
+I:6160:17600 176/352 17/50 | Lr: 3.501e-03, 3.501e-02 | M:0.14699/C:0.15126 | [8, 1, 384, 384] | seg_BCE: 0.12512 seg_UAL_0.27300: 0.02614
+I:6180:17600 196/352 17/50 | Lr: 3.512e-03, 3.512e-02 | M:0.15163/C:0.41712 | [8, 1, 384, 384] | seg_BCE: 0.37560 seg_UAL_0.27460: 0.04151
+I:6200:17600 216/352 17/50 | Lr: 3.523e-03, 3.523e-02 | M:0.15806/C:0.16478 | [8, 1, 384, 384] | seg_BCE: 0.12587 seg_UAL_0.27619: 0.03891
+I:6220:17600 236/352 17/50 | Lr: 3.535e-03, 3.535e-02 | M:0.15975/C:0.13138 | [8, 1, 384, 384] | seg_BCE: 0.09596 seg_UAL_0.27779: 0.03542
+I:6240:17600 256/352 17/50 | Lr: 3.546e-03, 3.546e-02 | M:0.16197/C:0.15475 | [8, 1, 384, 384] | seg_BCE: 0.12415 seg_UAL_0.27939: 0.03060
+I:6260:17600 276/352 17/50 | Lr: 3.557e-03, 3.557e-02 | M:0.16054/C:0.13726 | [8, 1, 384, 384] | seg_BCE: 0.11030 seg_UAL_0.28099: 0.02696
+I:6280:17600 296/352 17/50 | Lr: 3.569e-03, 3.569e-02 | M:0.16026/C:0.11678 | [8, 1, 384, 384] | seg_BCE: 0.09379 seg_UAL_0.28260: 0.02299
+I:6300:17600 316/352 17/50 | Lr: 3.580e-03, 3.580e-02 | M:0.16015/C:0.12126 | [8, 1, 384, 384] | seg_BCE: 0.08660 seg_UAL_0.28421: 0.03465
+I:6320:17600 336/352 17/50 | Lr: 3.591e-03, 3.591e-02 | M:0.15957/C:0.14817 | [8, 1, 384, 384] | seg_BCE: 0.11776 seg_UAL_0.28582: 0.03041
+I:6335:17600 351/352 17/50 | Lr: 3.600e-03, 3.600e-02 | M:0.15978/C:0.16804 | [8, 1, 384, 384] | seg_BCE: 0.13139 seg_UAL_0.28703: 0.03665
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:6340:17600 4/352 18/50 | Lr: 3.603e-03, 3.603e-02 | M:0.12403/C:0.13960 | [8, 1, 384, 384] | seg_BCE: 0.10933 seg_UAL_0.28743: 0.03027
+I:6360:17600 24/352 18/50 | Lr: 3.614e-03, 3.614e-02 | M:0.12580/C:0.11946 | [8, 1, 384, 384] | seg_BCE: 0.09746 seg_UAL_0.28905: 0.02200
+I:6380:17600 44/352 18/50 | Lr: 3.626e-03, 3.626e-02 | M:0.13608/C:0.13686 | [8, 1, 384, 384] | seg_BCE: 0.10739 seg_UAL_0.29067: 0.02947
+I:6400:17600 64/352 18/50 | Lr: 3.637e-03, 3.637e-02 | M:0.13829/C:0.13059 | [8, 1, 384, 384] | seg_BCE: 0.09928 seg_UAL_0.29229: 0.03131
+I:6420:17600 84/352 18/50 | Lr: 3.648e-03, 3.648e-02 | M:0.15214/C:0.10042 | [8, 1, 384, 384] | seg_BCE: 0.07990 seg_UAL_0.29392: 0.02052
+I:6440:17600 104/352 18/50 | Lr: 3.660e-03, 3.660e-02 | M:0.15188/C:0.11102 | [8, 1, 384, 384] | seg_BCE: 0.08562 seg_UAL_0.29555: 0.02539
+I:6460:17600 124/352 18/50 | Lr: 3.671e-03, 3.671e-02 | M:0.15381/C:0.17484 | [8, 1, 384, 384] | seg_BCE: 0.14526 seg_UAL_0.29718: 0.02957
+I:6480:17600 144/352 18/50 | Lr: 3.682e-03, 3.682e-02 | M:0.15447/C:0.22584 | [8, 1, 384, 384] | seg_BCE: 0.19754 seg_UAL_0.29881: 0.02829
+I:6500:17600 164/352 18/50 | Lr: 3.694e-03, 3.694e-02 | M:0.15512/C:0.13643 | [8, 1, 384, 384] | seg_BCE: 0.10363 seg_UAL_0.30044: 0.03280
+I:6520:17600 184/352 18/50 | Lr: 3.705e-03, 3.705e-02 | M:0.15551/C:0.11188 | [8, 1, 384, 384] | seg_BCE: 0.08371 seg_UAL_0.30208: 0.02817
+I:6540:17600 204/352 18/50 | Lr: 3.716e-03, 3.716e-02 | M:0.15732/C:0.13479 | [8, 1, 384, 384] | seg_BCE: 0.10380 seg_UAL_0.30372: 0.03100
+I:6560:17600 224/352 18/50 | Lr: 3.728e-03, 3.728e-02 | M:0.15942/C:0.17855 | [8, 1, 384, 384] | seg_BCE: 0.14802 seg_UAL_0.30536: 0.03054
+I:6580:17600 244/352 18/50 | Lr: 3.739e-03, 3.739e-02 | M:0.16143/C:0.10195 | [8, 1, 384, 384] | seg_BCE: 0.07498 seg_UAL_0.30701: 0.02697
+I:6600:17600 264/352 18/50 | Lr: 3.751e-03, 3.751e-02 | M:0.16039/C:0.14255 | [8, 1, 384, 384] | seg_BCE: 0.11050 seg_UAL_0.30866: 0.03205
+I:6620:17600 284/352 18/50 | Lr: 3.762e-03, 3.762e-02 | M:0.16189/C:0.19068 | [8, 1, 384, 384] | seg_BCE: 0.15634 seg_UAL_0.31031: 0.03434
+I:6640:17600 304/352 18/50 | Lr: 3.773e-03, 3.773e-02 | M:0.16457/C:0.12868 | [8, 1, 384, 384] | seg_BCE: 0.10319 seg_UAL_0.31196: 0.02549
+I:6660:17600 324/352 18/50 | Lr: 3.785e-03, 3.785e-02 | M:0.16640/C:0.15315 | [8, 1, 384, 384] | seg_BCE: 0.11454 seg_UAL_0.31362: 0.03861
+I:6680:17600 344/352 18/50 | Lr: 3.796e-03, 3.796e-02 | M:0.16653/C:0.15307 | [8, 1, 384, 384] | seg_BCE: 0.12311 seg_UAL_0.31527: 0.02996
+I:6687:17600 351/352 18/50 | Lr: 3.800e-03, 3.800e-02 | M:0.16638/C:0.21078 | [8, 1, 384, 384] | seg_BCE: 0.16515 seg_UAL_0.31585: 0.04563
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:6700:17600 12/352 19/50 | Lr: 3.807e-03, 3.807e-02 | M:0.14516/C:0.17558 | [8, 1, 384, 384] | seg_BCE: 0.15167 seg_UAL_0.31693: 0.02392
+I:6720:17600 32/352 19/50 | Lr: 3.819e-03, 3.819e-02 | M:0.15594/C:0.19196 | [8, 1, 384, 384] | seg_BCE: 0.15542 seg_UAL_0.31860: 0.03653
+I:6740:17600 52/352 19/50 | Lr: 3.830e-03, 3.830e-02 | M:0.15312/C:0.12476 | [8, 1, 384, 384] | seg_BCE: 0.10444 seg_UAL_0.32026: 0.02032
+I:6760:17600 72/352 19/50 | Lr: 3.841e-03, 3.841e-02 | M:0.15106/C:0.16314 | [8, 1, 384, 384] | seg_BCE: 0.12617 seg_UAL_0.32193: 0.03696
+I:6780:17600 92/352 19/50 | Lr: 3.853e-03, 3.853e-02 | M:0.15018/C:0.10883 | [8, 1, 384, 384] | seg_BCE: 0.07857 seg_UAL_0.32360: 0.03026
+I:6800:17600 112/352 19/50 | Lr: 3.864e-03, 3.864e-02 | M:0.15446/C:0.25285 | [8, 1, 384, 384] | seg_BCE: 0.22034 seg_UAL_0.32527: 0.03250
+I:6820:17600 132/352 19/50 | Lr: 3.876e-03, 3.876e-02 | M:0.15312/C:0.14159 | [8, 1, 384, 384] | seg_BCE: 0.11292 seg_UAL_0.32694: 0.02867
+I:6840:17600 152/352 19/50 | Lr: 3.887e-03, 3.887e-02 | M:0.15240/C:0.11343 | [8, 1, 384, 384] | seg_BCE: 0.08935 seg_UAL_0.32862: 0.02407
+I:6860:17600 172/352 19/50 | Lr: 3.898e-03, 3.898e-02 | M:0.15187/C:0.14792 | [8, 1, 384, 384] | seg_BCE: 0.11689 seg_UAL_0.33030: 0.03104
+I:6880:17600 192/352 19/50 | Lr: 3.910e-03, 3.910e-02 | M:0.15223/C:0.13353 | [8, 1, 384, 384] | seg_BCE: 0.10732 seg_UAL_0.33198: 0.02621
+I:6900:17600 212/352 19/50 | Lr: 3.921e-03, 3.921e-02 | M:0.15332/C:0.18132 | [8, 1, 384, 384] | seg_BCE: 0.14715 seg_UAL_0.33366: 0.03418
+I:6920:17600 232/352 19/50 | Lr: 3.932e-03, 3.932e-02 | M:0.15473/C:0.18559 | [8, 1, 384, 384] | seg_BCE: 0.14111 seg_UAL_0.33534: 0.04448
+I:6940:17600 252/352 19/50 | Lr: 3.944e-03, 3.944e-02 | M:0.15639/C:0.11389 | [8, 1, 384, 384] | seg_BCE: 0.08350 seg_UAL_0.33703: 0.03039
+I:6960:17600 272/352 19/50 | Lr: 3.955e-03, 3.955e-02 | M:0.15705/C:0.19578 | [8, 1, 384, 384] | seg_BCE: 0.15588 seg_UAL_0.33872: 0.03991
+I:6980:17600 292/352 19/50 | Lr: 3.966e-03, 3.966e-02 | M:0.15609/C:0.08751 | [8, 1, 384, 384] | seg_BCE: 0.06658 seg_UAL_0.34041: 0.02093
+I:7000:17600 312/352 19/50 | Lr: 3.978e-03, 3.978e-02 | M:0.15496/C:0.15011 | [8, 1, 384, 384] | seg_BCE: 0.11135 seg_UAL_0.34210: 0.03876
+I:7020:17600 332/352 19/50 | Lr: 3.989e-03, 3.989e-02 | M:0.15401/C:0.11876 | [8, 1, 384, 384] | seg_BCE: 0.08320 seg_UAL_0.34379: 0.03556
+I:7039:17600 351/352 19/50 | Lr: 4.000e-03, 4.000e-02 | M:0.15424/C:0.18463 | [8, 1, 384, 384] | seg_BCE: 0.15222 seg_UAL_0.34541: 0.03241
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:7040:17600 0/352 20/50 | Lr: 4.001e-03, 4.001e-02 | M:0.14251/C:0.14251 | [8, 1, 384, 384] | seg_BCE: 0.10844 seg_UAL_0.34549: 0.03407
+I:7060:17600 20/352 20/50 | Lr: 4.012e-03, 4.012e-02 | M:0.14693/C:0.13441 | [8, 1, 384, 384] | seg_BCE: 0.10672 seg_UAL_0.34719: 0.02769
+I:7080:17600 40/352 20/50 | Lr: 4.023e-03, 4.023e-02 | M:0.14090/C:0.18482 | [8, 1, 384, 384] | seg_BCE: 0.15071 seg_UAL_0.34889: 0.03411
+I:7100:17600 60/352 20/50 | Lr: 4.035e-03, 4.035e-02 | M:0.14203/C:0.29101 | [8, 1, 384, 384] | seg_BCE: 0.26286 seg_UAL_0.35059: 0.02815
+I:7120:17600 80/352 20/50 | Lr: 4.046e-03, 4.046e-02 | M:0.15095/C:0.18111 | [8, 1, 384, 384] | seg_BCE: 0.13526 seg_UAL_0.35230: 0.04585
+I:7140:17600 100/352 20/50 | Lr: 4.057e-03, 4.057e-02 | M:0.15512/C:0.12947 | [8, 1, 384, 384] | seg_BCE: 0.09465 seg_UAL_0.35400: 0.03483
+I:7160:17600 120/352 20/50 | Lr: 4.069e-03, 4.069e-02 | M:0.15884/C:0.09338 | [8, 1, 384, 384] | seg_BCE: 0.05976 seg_UAL_0.35571: 0.03362
+I:7180:17600 140/352 20/50 | Lr: 4.080e-03, 4.080e-02 | M:0.15716/C:0.09436 | [8, 1, 384, 384] | seg_BCE: 0.07369 seg_UAL_0.35742: 0.02067
+I:7200:17600 160/352 20/50 | Lr: 4.091e-03, 4.091e-02 | M:0.15732/C:0.11498 | [8, 1, 384, 384] | seg_BCE: 0.08735 seg_UAL_0.35913: 0.02762
+I:7220:17600 180/352 20/50 | Lr: 4.103e-03, 4.103e-02 | M:0.15663/C:0.13921 | [8, 1, 384, 384] | seg_BCE: 0.11641 seg_UAL_0.36085: 0.02280
+I:7240:17600 200/352 20/50 | Lr: 4.114e-03, 4.114e-02 | M:0.15709/C:0.21934 | [8, 1, 384, 384] | seg_BCE: 0.18202 seg_UAL_0.36256: 0.03732
+I:7260:17600 220/352 20/50 | Lr: 4.126e-03, 4.126e-02 | M:0.15847/C:0.17763 | [8, 1, 384, 384] | seg_BCE: 0.14379 seg_UAL_0.36428: 0.03384
+I:7280:17600 240/352 20/50 | Lr: 4.137e-03, 4.137e-02 | M:0.15702/C:0.08843 | [8, 1, 384, 384] | seg_BCE: 0.06428 seg_UAL_0.36600: 0.02415
+I:7300:17600 260/352 20/50 | Lr: 4.148e-03, 4.148e-02 | M:0.15625/C:0.14268 | [8, 1, 384, 384] | seg_BCE: 0.11474 seg_UAL_0.36772: 0.02794
+I:7320:17600 280/352 20/50 | Lr: 4.160e-03, 4.160e-02 | M:0.15690/C:0.16204 | [8, 1, 384, 384] | seg_BCE: 0.12944 seg_UAL_0.36944: 0.03259
+I:7340:17600 300/352 20/50 | Lr: 4.171e-03, 4.171e-02 | M:0.15717/C:0.14706 | [8, 1, 384, 384] | seg_BCE: 0.11208 seg_UAL_0.37117: 0.03497
+I:7360:17600 320/352 20/50 | Lr: 4.182e-03, 4.182e-02 | M:0.15659/C:0.14482 | [8, 1, 384, 384] | seg_BCE: 0.11689 seg_UAL_0.37289: 0.02794
+I:7380:17600 340/352 20/50 | Lr: 4.194e-03, 4.194e-02 | M:0.15765/C:0.28418 | [8, 1, 384, 384] | seg_BCE: 0.23697 seg_UAL_0.37462: 0.04720
+I:7391:17600 351/352 20/50 | Lr: 4.200e-03, 4.200e-02 | M:0.15774/C:0.07951 | [8, 1, 384, 384] | seg_BCE: 0.05683 seg_UAL_0.37557: 0.02268
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:7400:17600 8/352 21/50 | Lr: 4.205e-03, 4.205e-02 | M:0.17033/C:0.26187 | [8, 1, 384, 384] | seg_BCE: 0.22804 seg_UAL_0.37635: 0.03383
+I:7420:17600 28/352 21/50 | Lr: 4.216e-03, 4.216e-02 | M:0.18520/C:0.15442 | [8, 1, 384, 384] | seg_BCE: 0.11699 seg_UAL_0.37808: 0.03742
+I:7440:17600 48/352 21/50 | Lr: 4.228e-03, 4.228e-02 | M:0.17530/C:0.12361 | [8, 1, 384, 384] | seg_BCE: 0.08541 seg_UAL_0.37981: 0.03820
+I:7460:17600 68/352 21/50 | Lr: 4.239e-03, 4.239e-02 | M:0.16784/C:0.14114 | [8, 1, 384, 384] | seg_BCE: 0.11164 seg_UAL_0.38154: 0.02950
+I:7480:17600 88/352 21/50 | Lr: 4.251e-03, 4.251e-02 | M:0.16547/C:0.15170 | [8, 1, 384, 384] | seg_BCE: 0.11456 seg_UAL_0.38328: 0.03714
+I:7500:17600 108/352 21/50 | Lr: 4.262e-03, 4.262e-02 | M:0.16048/C:0.11715 | [8, 1, 384, 384] | seg_BCE: 0.09062 seg_UAL_0.38501: 0.02653
+I:7520:17600 128/352 21/50 | Lr: 4.273e-03, 4.273e-02 | M:0.15855/C:0.18362 | [8, 1, 384, 384] | seg_BCE: 0.14466 seg_UAL_0.38675: 0.03896
+I:7540:17600 148/352 21/50 | Lr: 4.285e-03, 4.285e-02 | M:0.15949/C:0.20015 | [8, 1, 384, 384] | seg_BCE: 0.15949 seg_UAL_0.38849: 0.04066
+I:7560:17600 168/352 21/50 | Lr: 4.296e-03, 4.296e-02 | M:0.16134/C:0.12254 | [8, 1, 384, 384] | seg_BCE: 0.09491 seg_UAL_0.39023: 0.02763
+I:7580:17600 188/352 21/50 | Lr: 4.307e-03, 4.307e-02 | M:0.16121/C:0.13494 | [8, 1, 384, 384] | seg_BCE: 0.10420 seg_UAL_0.39197: 0.03074
+I:7600:17600 208/352 21/50 | Lr: 4.319e-03, 4.319e-02 | M:0.16362/C:0.19343 | [8, 1, 384, 384] | seg_BCE: 0.14411 seg_UAL_0.39372: 0.04932
+I:7620:17600 228/352 21/50 | Lr: 4.330e-03, 4.330e-02 | M:0.16621/C:0.11072 | [8, 1, 384, 384] | seg_BCE: 0.07985 seg_UAL_0.39546: 0.03088
+I:7640:17600 248/352 21/50 | Lr: 4.341e-03, 4.341e-02 | M:0.16763/C:0.27928 | [8, 1, 384, 384] | seg_BCE: 0.22785 seg_UAL_0.39721: 0.05142
+I:7660:17600 268/352 21/50 | Lr: 4.353e-03, 4.353e-02 | M:0.16978/C:0.17421 | [8, 1, 384, 384] | seg_BCE: 0.12149 seg_UAL_0.39896: 0.05272
+I:7680:17600 288/352 21/50 | Lr: 4.364e-03, 4.364e-02 | M:0.17091/C:0.15737 | [8, 1, 384, 384] | seg_BCE: 0.11558 seg_UAL_0.40070: 0.04180
+I:7700:17600 308/352 21/50 | Lr: 4.376e-03, 4.376e-02 | M:0.17281/C:0.11642 | [8, 1, 384, 384] | seg_BCE: 0.07363 seg_UAL_0.40245: 0.04279
+I:7720:17600 328/352 21/50 | Lr: 4.387e-03, 4.387e-02 | M:0.17399/C:0.22009 | [8, 1, 384, 384] | seg_BCE: 0.18073 seg_UAL_0.40421: 0.03936
+I:7740:17600 348/352 21/50 | Lr: 4.398e-03, 4.398e-02 | M:0.17551/C:0.18999 | [8, 1, 384, 384] | seg_BCE: 0.13758 seg_UAL_0.40596: 0.05242
+I:7743:17600 351/352 21/50 | Lr: 4.400e-03, 4.400e-02 | M:0.17555/C:0.14672 | [8, 1, 384, 384] | seg_BCE: 0.11072 seg_UAL_0.40622: 0.03600
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:7760:17600 16/352 22/50 | Lr: 4.410e-03, 4.410e-02 | M:0.15852/C:0.15019 | [8, 1, 384, 384] | seg_BCE: 0.11432 seg_UAL_0.40771: 0.03588
+I:7780:17600 36/352 22/50 | Lr: 4.421e-03, 4.421e-02 | M:0.15494/C:0.13822 | [8, 1, 384, 384] | seg_BCE: 0.11256 seg_UAL_0.40947: 0.02566
+I:7800:17600 56/352 22/50 | Lr: 4.432e-03, 4.432e-02 | M:0.15004/C:0.08669 | [8, 1, 384, 384] | seg_BCE: 0.06216 seg_UAL_0.41122: 0.02453
+I:7820:17600 76/352 22/50 | Lr: 4.444e-03, 4.444e-02 | M:0.15373/C:0.13097 | [8, 1, 384, 384] | seg_BCE: 0.09846 seg_UAL_0.41298: 0.03252
+I:7840:17600 96/352 22/50 | Lr: 4.455e-03, 4.455e-02 | M:0.15909/C:0.21638 | [8, 1, 384, 384] | seg_BCE: 0.17020 seg_UAL_0.41474: 0.04619
+I:7860:17600 116/352 22/50 | Lr: 4.466e-03, 4.466e-02 | M:0.16012/C:0.14727 | [8, 1, 384, 384] | seg_BCE: 0.11621 seg_UAL_0.41650: 0.03106
+I:7880:17600 136/352 22/50 | Lr: 4.478e-03, 4.478e-02 | M:0.16188/C:0.39401 | [8, 1, 384, 384] | seg_BCE: 0.33728 seg_UAL_0.41826: 0.05673
+I:7900:17600 156/352 22/50 | Lr: 4.489e-03, 4.489e-02 | M:0.16420/C:0.26526 | [8, 1, 384, 384] | seg_BCE: 0.21599 seg_UAL_0.42002: 0.04928
+I:7920:17600 176/352 22/50 | Lr: 4.501e-03, 4.501e-02 | M:0.16369/C:0.16965 | [8, 1, 384, 384] | seg_BCE: 0.13814 seg_UAL_0.42178: 0.03152
+I:7940:17600 196/352 22/50 | Lr: 4.512e-03, 4.512e-02 | M:0.16308/C:0.15312 | [8, 1, 384, 384] | seg_BCE: 0.12143 seg_UAL_0.42355: 0.03169
+I:7960:17600 216/352 22/50 | Lr: 4.523e-03, 4.523e-02 | M:0.16101/C:0.16197 | [8, 1, 384, 384] | seg_BCE: 0.12388 seg_UAL_0.42531: 0.03809
+I:7980:17600 236/352 22/50 | Lr: 4.535e-03, 4.535e-02 | M:0.16151/C:0.16216 | [8, 1, 384, 384] | seg_BCE: 0.12494 seg_UAL_0.42708: 0.03722
+I:8000:17600 256/352 22/50 | Lr: 4.546e-03, 4.546e-02 | M:0.16123/C:0.14046 | [8, 1, 384, 384] | seg_BCE: 0.11076 seg_UAL_0.42884: 0.02970
+I:8020:17600 276/352 22/50 | Lr: 4.557e-03, 4.557e-02 | M:0.16190/C:0.20029 | [8, 1, 384, 384] | seg_BCE: 0.15550 seg_UAL_0.43061: 0.04479
+I:8040:17600 296/352 22/50 | Lr: 4.569e-03, 4.569e-02 | M:0.16234/C:0.20351 | [8, 1, 384, 384] | seg_BCE: 0.16280 seg_UAL_0.43238: 0.04072
+I:8060:17600 316/352 22/50 | Lr: 4.580e-03, 4.580e-02 | M:0.16215/C:0.14256 | [8, 1, 384, 384] | seg_BCE: 0.10237 seg_UAL_0.43415: 0.04019
+I:8080:17600 336/352 22/50 | Lr: 4.591e-03, 4.591e-02 | M:0.16304/C:0.21525 | [8, 1, 384, 384] | seg_BCE: 0.16385 seg_UAL_0.43592: 0.05140
+I:8095:17600 351/352 22/50 | Lr: 4.600e-03, 4.600e-02 | M:0.16371/C:0.14706 | [8, 1, 384, 384] | seg_BCE: 0.10707 seg_UAL_0.43724: 0.03998
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:8100:17600 4/352 23/50 | Lr: 4.603e-03, 4.603e-02 | M:0.17537/C:0.08842 | [8, 1, 384, 384] | seg_BCE: 0.05451 seg_UAL_0.43769: 0.03391
+I:8120:17600 24/352 23/50 | Lr: 4.614e-03, 4.614e-02 | M:0.18408/C:0.14032 | [8, 1, 384, 384] | seg_BCE: 0.10211 seg_UAL_0.43946: 0.03821
+I:8140:17600 44/352 23/50 | Lr: 4.626e-03, 4.626e-02 | M:0.17858/C:0.19081 | [8, 1, 384, 384] | seg_BCE: 0.14608 seg_UAL_0.44123: 0.04472
+I:8160:17600 64/352 23/50 | Lr: 4.637e-03, 4.637e-02 | M:0.16971/C:0.10035 | [8, 1, 384, 384] | seg_BCE: 0.07257 seg_UAL_0.44300: 0.02777
+I:8180:17600 84/352 23/50 | Lr: 4.648e-03, 4.648e-02 | M:0.16581/C:0.16230 | [8, 1, 384, 384] | seg_BCE: 0.12470 seg_UAL_0.44478: 0.03760
+I:8200:17600 104/352 23/50 | Lr: 4.660e-03, 4.660e-02 | M:0.16718/C:0.20592 | [8, 1, 384, 384] | seg_BCE: 0.15145 seg_UAL_0.44655: 0.05447
+I:8220:17600 124/352 23/50 | Lr: 4.671e-03, 4.671e-02 | M:0.17203/C:0.20852 | [8, 1, 384, 384] | seg_BCE: 0.17430 seg_UAL_0.44833: 0.03422
+I:8240:17600 144/352 23/50 | Lr: 4.682e-03, 4.682e-02 | M:0.17628/C:0.36440 | [8, 1, 384, 384] | seg_BCE: 0.30942 seg_UAL_0.45010: 0.05498
+I:8260:17600 164/352 23/50 | Lr: 4.694e-03, 4.694e-02 | M:0.17905/C:0.19743 | [8, 1, 384, 384] | seg_BCE: 0.14723 seg_UAL_0.45188: 0.05020
+I:8280:17600 184/352 23/50 | Lr: 4.705e-03, 4.705e-02 | M:0.17981/C:0.21337 | [8, 1, 384, 384] | seg_BCE: 0.16195 seg_UAL_0.45366: 0.05142
+I:8300:17600 204/352 23/50 | Lr: 4.716e-03, 4.716e-02 | M:0.18041/C:0.14324 | [8, 1, 384, 384] | seg_BCE: 0.10946 seg_UAL_0.45543: 0.03378
+I:8320:17600 224/352 23/50 | Lr: 4.728e-03, 4.728e-02 | M:0.18399/C:0.11496 | [8, 1, 384, 384] | seg_BCE: 0.08145 seg_UAL_0.45721: 0.03351
+I:8340:17600 244/352 23/50 | Lr: 4.739e-03, 4.739e-02 | M:0.18504/C:0.14125 | [8, 1, 384, 384] | seg_BCE: 0.10525 seg_UAL_0.45899: 0.03600
+I:8360:17600 264/352 23/50 | Lr: 4.751e-03, 4.751e-02 | M:0.18424/C:0.21855 | [8, 1, 384, 384] | seg_BCE: 0.17974 seg_UAL_0.46077: 0.03881
+I:8380:17600 284/352 23/50 | Lr: 4.762e-03, 4.762e-02 | M:0.18346/C:0.20268 | [8, 1, 384, 384] | seg_BCE: 0.15795 seg_UAL_0.46255: 0.04472
+I:8400:17600 304/352 23/50 | Lr: 4.773e-03, 4.773e-02 | M:0.18180/C:0.21425 | [8, 1, 384, 384] | seg_BCE: 0.17446 seg_UAL_0.46433: 0.03978
+I:8420:17600 324/352 23/50 | Lr: 4.785e-03, 4.785e-02 | M:0.18061/C:0.14060 | [8, 1, 384, 384] | seg_BCE: 0.10186 seg_UAL_0.46611: 0.03874
+I:8440:17600 344/352 23/50 | Lr: 4.796e-03, 4.796e-02 | M:0.17993/C:0.15099 | [8, 1, 384, 384] | seg_BCE: 0.11112 seg_UAL_0.46789: 0.03987
+I:8447:17600 351/352 23/50 | Lr: 4.800e-03, 4.800e-02 | M:0.18005/C:0.19474 | [8, 1, 384, 384] | seg_BCE: 0.15130 seg_UAL_0.46852: 0.04344
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:8460:17600 12/352 24/50 | Lr: 4.807e-03, 4.807e-02 | M:0.17153/C:0.18180 | [8, 1, 384, 384] | seg_BCE: 0.13667 seg_UAL_0.46967: 0.04512
+I:8480:17600 32/352 24/50 | Lr: 4.819e-03, 4.819e-02 | M:0.17770/C:0.17709 | [8, 1, 384, 384] | seg_BCE: 0.12361 seg_UAL_0.47146: 0.05348
+I:8500:17600 52/352 24/50 | Lr: 4.830e-03, 4.830e-02 | M:0.17234/C:0.16193 | [8, 1, 384, 384] | seg_BCE: 0.12787 seg_UAL_0.47324: 0.03406
+I:8520:17600 72/352 24/50 | Lr: 4.841e-03, 4.841e-02 | M:0.16490/C:0.10549 | [8, 1, 384, 384] | seg_BCE: 0.07472 seg_UAL_0.47502: 0.03077
+I:8540:17600 92/352 24/50 | Lr: 4.853e-03, 4.853e-02 | M:0.16230/C:0.13795 | [8, 1, 384, 384] | seg_BCE: 0.10019 seg_UAL_0.47680: 0.03775
+I:8560:17600 112/352 24/50 | Lr: 4.864e-03, 4.864e-02 | M:0.16316/C:0.33264 | [8, 1, 384, 384] | seg_BCE: 0.29913 seg_UAL_0.47859: 0.03351
+I:8580:17600 132/352 24/50 | Lr: 4.876e-03, 4.876e-02 | M:0.16173/C:0.08519 | [8, 1, 384, 384] | seg_BCE: 0.05563 seg_UAL_0.48037: 0.02956
+I:8600:17600 152/352 24/50 | Lr: 4.887e-03, 4.887e-02 | M:0.16234/C:0.19742 | [8, 1, 384, 384] | seg_BCE: 0.15653 seg_UAL_0.48215: 0.04089
+I:8620:17600 172/352 24/50 | Lr: 4.898e-03, 4.898e-02 | M:0.16099/C:0.13984 | [8, 1, 384, 384] | seg_BCE: 0.10772 seg_UAL_0.48394: 0.03212
+I:8640:17600 192/352 24/50 | Lr: 4.910e-03, 4.910e-02 | M:0.16242/C:0.17504 | [8, 1, 384, 384] | seg_BCE: 0.12844 seg_UAL_0.48572: 0.04660
+I:8660:17600 212/352 24/50 | Lr: 4.921e-03, 4.921e-02 | M:0.16248/C:0.17816 | [8, 1, 384, 384] | seg_BCE: 0.13981 seg_UAL_0.48751: 0.03836
+I:8680:17600 232/352 24/50 | Lr: 4.932e-03, 4.932e-02 | M:0.16211/C:0.14319 | [8, 1, 384, 384] | seg_BCE: 0.10381 seg_UAL_0.48929: 0.03938
+I:8700:17600 252/352 24/50 | Lr: 4.944e-03, 4.944e-02 | M:0.16853/C:0.20450 | [8, 1, 384, 384] | seg_BCE: 0.14055 seg_UAL_0.49108: 0.06395
+I:8720:17600 272/352 24/50 | Lr: 4.955e-03, 4.955e-02 | M:0.17182/C:0.18924 | [8, 1, 384, 384] | seg_BCE: 0.13913 seg_UAL_0.49286: 0.05010
+I:8740:17600 292/352 24/50 | Lr: 4.966e-03, 4.966e-02 | M:0.17420/C:0.24533 | [8, 1, 384, 384] | seg_BCE: 0.20092 seg_UAL_0.49465: 0.04440
+I:8760:17600 312/352 24/50 | Lr: 4.978e-03, 4.978e-02 | M:0.17606/C:0.19041 | [8, 1, 384, 384] | seg_BCE: 0.13392 seg_UAL_0.49643: 0.05649
+I:8780:17600 332/352 24/50 | Lr: 4.989e-03, 4.989e-02 | M:0.17757/C:0.20746 | [8, 1, 384, 384] | seg_BCE: 0.14866 seg_UAL_0.49822: 0.05880
+I:8799:17600 351/352 24/50 | Lr: 5.000e-03, 5.000e-02 | M:0.17681/C:0.16896 | [8, 1, 384, 384] | seg_BCE: 0.13149 seg_UAL_0.49991: 0.03747
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:8800:17600 0/352 25/50 | Lr: 4.999e-03, 4.999e-02 | M:0.12698/C:0.12698 | [8, 1, 384, 384] | seg_BCE: 0.09717 seg_UAL_0.50000: 0.02981
+I:8820:17600 20/352 25/50 | Lr: 4.988e-03, 4.988e-02 | M:0.14327/C:0.08132 | [8, 1, 384, 384] | seg_BCE: 0.05766 seg_UAL_0.50178: 0.02366
+I:8840:17600 40/352 25/50 | Lr: 4.977e-03, 4.977e-02 | M:0.14494/C:0.17730 | [8, 1, 384, 384] | seg_BCE: 0.13431 seg_UAL_0.50357: 0.04299
+I:8860:17600 60/352 25/50 | Lr: 4.965e-03, 4.965e-02 | M:0.15357/C:0.14864 | [8, 1, 384, 384] | seg_BCE: 0.11921 seg_UAL_0.50535: 0.02944
+I:8880:17600 80/352 25/50 | Lr: 4.954e-03, 4.954e-02 | M:0.15154/C:0.14077 | [8, 1, 384, 384] | seg_BCE: 0.10627 seg_UAL_0.50714: 0.03450
+I:8900:17600 100/352 25/50 | Lr: 4.943e-03, 4.943e-02 | M:0.15439/C:0.35357 | [8, 1, 384, 384] | seg_BCE: 0.30211 seg_UAL_0.50892: 0.05146
+I:8920:17600 120/352 25/50 | Lr: 4.931e-03, 4.931e-02 | M:0.15551/C:0.15642 | [8, 1, 384, 384] | seg_BCE: 0.11741 seg_UAL_0.51071: 0.03901
+I:8940:17600 140/352 25/50 | Lr: 4.920e-03, 4.920e-02 | M:0.15624/C:0.11490 | [8, 1, 384, 384] | seg_BCE: 0.07509 seg_UAL_0.51249: 0.03981
+I:8960:17600 160/352 25/50 | Lr: 4.909e-03, 4.909e-02 | M:0.15562/C:0.18326 | [8, 1, 384, 384] | seg_BCE: 0.14223 seg_UAL_0.51428: 0.04102
+I:8980:17600 180/352 25/50 | Lr: 4.897e-03, 4.897e-02 | M:0.15671/C:0.14457 | [8, 1, 384, 384] | seg_BCE: 0.10241 seg_UAL_0.51606: 0.04216
+I:9000:17600 200/352 25/50 | Lr: 4.886e-03, 4.886e-02 | M:0.16023/C:0.21915 | [8, 1, 384, 384] | seg_BCE: 0.15823 seg_UAL_0.51785: 0.06092
+I:9020:17600 220/352 25/50 | Lr: 4.874e-03, 4.874e-02 | M:0.16324/C:0.14043 | [8, 1, 384, 384] | seg_BCE: 0.10778 seg_UAL_0.51963: 0.03265
+I:9040:17600 240/352 25/50 | Lr: 4.863e-03, 4.863e-02 | M:0.16426/C:0.26439 | [8, 1, 384, 384] | seg_BCE: 0.21623 seg_UAL_0.52141: 0.04817
+I:9060:17600 260/352 25/50 | Lr: 4.852e-03, 4.852e-02 | M:0.16679/C:0.13290 | [8, 1, 384, 384] | seg_BCE: 0.09143 seg_UAL_0.52320: 0.04148
+I:9080:17600 280/352 25/50 | Lr: 4.840e-03, 4.840e-02 | M:0.16980/C:0.18060 | [8, 1, 384, 384] | seg_BCE: 0.13209 seg_UAL_0.52498: 0.04851
+I:9100:17600 300/352 25/50 | Lr: 4.829e-03, 4.829e-02 | M:0.17080/C:0.14733 | [8, 1, 384, 384] | seg_BCE: 0.11353 seg_UAL_0.52676: 0.03380
+I:9120:17600 320/352 25/50 | Lr: 4.818e-03, 4.818e-02 | M:0.17310/C:0.18721 | [8, 1, 384, 384] | seg_BCE: 0.12623 seg_UAL_0.52854: 0.06098
+I:9140:17600 340/352 25/50 | Lr: 4.806e-03, 4.806e-02 | M:0.17515/C:0.21857 | [8, 1, 384, 384] | seg_BCE: 0.16351 seg_UAL_0.53033: 0.05506
+I:9151:17600 351/352 25/50 | Lr: 4.800e-03, 4.800e-02 | M:0.17637/C:0.18948 | [8, 1, 384, 384] | seg_BCE: 0.13235 seg_UAL_0.53131: 0.05713
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:9160:17600 8/352 26/50 | Lr: 4.795e-03, 4.795e-02 | M:0.20892/C:0.17573 | [8, 1, 384, 384] | seg_BCE: 0.13249 seg_UAL_0.53211: 0.04324
+I:9180:17600 28/352 26/50 | Lr: 4.784e-03, 4.784e-02 | M:0.16477/C:0.10781 | [8, 1, 384, 384] | seg_BCE: 0.07691 seg_UAL_0.53389: 0.03090
+I:9200:17600 48/352 26/50 | Lr: 4.772e-03, 4.772e-02 | M:0.16278/C:0.12194 | [8, 1, 384, 384] | seg_BCE: 0.08574 seg_UAL_0.53567: 0.03620
+I:9220:17600 68/352 26/50 | Lr: 4.761e-03, 4.761e-02 | M:0.15816/C:0.14215 | [8, 1, 384, 384] | seg_BCE: 0.09981 seg_UAL_0.53745: 0.04234
+I:9240:17600 88/352 26/50 | Lr: 4.749e-03, 4.749e-02 | M:0.16630/C:0.23011 | [8, 1, 384, 384] | seg_BCE: 0.18575 seg_UAL_0.53923: 0.04436
+I:9260:17600 108/352 26/50 | Lr: 4.738e-03, 4.738e-02 | M:0.16399/C:0.14183 | [8, 1, 384, 384] | seg_BCE: 0.10305 seg_UAL_0.54101: 0.03878
+I:9280:17600 128/352 26/50 | Lr: 4.727e-03, 4.727e-02 | M:0.16564/C:0.14746 | [8, 1, 384, 384] | seg_BCE: 0.10622 seg_UAL_0.54279: 0.04124
+I:9300:17600 148/352 26/50 | Lr: 4.715e-03, 4.715e-02 | M:0.16492/C:0.12093 | [8, 1, 384, 384] | seg_BCE: 0.08552 seg_UAL_0.54457: 0.03541
+I:9320:17600 168/352 26/50 | Lr: 4.704e-03, 4.704e-02 | M:0.16245/C:0.14254 | [8, 1, 384, 384] | seg_BCE: 0.11198 seg_UAL_0.54634: 0.03056
+I:9340:17600 188/352 26/50 | Lr: 4.693e-03, 4.693e-02 | M:0.16216/C:0.11581 | [8, 1, 384, 384] | seg_BCE: 0.08118 seg_UAL_0.54812: 0.03464
+I:9360:17600 208/352 26/50 | Lr: 4.681e-03, 4.681e-02 | M:0.16382/C:0.15933 | [8, 1, 384, 384] | seg_BCE: 0.11824 seg_UAL_0.54990: 0.04110
+I:9380:17600 228/352 26/50 | Lr: 4.670e-03, 4.670e-02 | M:0.16288/C:0.08401 | [8, 1, 384, 384] | seg_BCE: 0.05479 seg_UAL_0.55167: 0.02922
+I:9400:17600 248/352 26/50 | Lr: 4.659e-03, 4.659e-02 | M:0.16340/C:0.12888 | [8, 1, 384, 384] | seg_BCE: 0.09599 seg_UAL_0.55345: 0.03290
+I:9420:17600 268/352 26/50 | Lr: 4.647e-03, 4.647e-02 | M:0.16422/C:0.12458 | [8, 1, 384, 384] | seg_BCE: 0.09026 seg_UAL_0.55522: 0.03432
+I:9440:17600 288/352 26/50 | Lr: 4.636e-03, 4.636e-02 | M:0.16438/C:0.11792 | [8, 1, 384, 384] | seg_BCE: 0.08872 seg_UAL_0.55700: 0.02919
+I:9460:17600 308/352 26/50 | Lr: 4.624e-03, 4.624e-02 | M:0.16357/C:0.20301 | [8, 1, 384, 384] | seg_BCE: 0.16358 seg_UAL_0.55877: 0.03943
+I:9480:17600 328/352 26/50 | Lr: 4.613e-03, 4.613e-02 | M:0.16336/C:0.15238 | [8, 1, 384, 384] | seg_BCE: 0.11513 seg_UAL_0.56054: 0.03725
+I:9500:17600 348/352 26/50 | Lr: 4.602e-03, 4.602e-02 | M:0.16215/C:0.10699 | [8, 1, 384, 384] | seg_BCE: 0.06807 seg_UAL_0.56231: 0.03893
+I:9503:17600 351/352 26/50 | Lr: 4.600e-03, 4.600e-02 | M:0.16215/C:0.15062 | [8, 1, 384, 384] | seg_BCE: 0.11603 seg_UAL_0.56258: 0.03459
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:9520:17600 16/352 27/50 | Lr: 4.590e-03, 4.590e-02 | M:0.16760/C:0.11267 | [8, 1, 384, 384] | seg_BCE: 0.07822 seg_UAL_0.56408: 0.03445
+I:9540:17600 36/352 27/50 | Lr: 4.579e-03, 4.579e-02 | M:0.15504/C:0.19363 | [8, 1, 384, 384] | seg_BCE: 0.15415 seg_UAL_0.56585: 0.03948
+I:9560:17600 56/352 27/50 | Lr: 4.568e-03, 4.568e-02 | M:0.15108/C:0.09990 | [8, 1, 384, 384] | seg_BCE: 0.07516 seg_UAL_0.56762: 0.02474
+I:9580:17600 76/352 27/50 | Lr: 4.556e-03, 4.556e-02 | M:0.15310/C:0.07419 | [8, 1, 384, 384] | seg_BCE: 0.04872 seg_UAL_0.56939: 0.02547
+I:9600:17600 96/352 27/50 | Lr: 4.545e-03, 4.545e-02 | M:0.15210/C:0.17087 | [8, 1, 384, 384] | seg_BCE: 0.12997 seg_UAL_0.57116: 0.04091
+I:9620:17600 116/352 27/50 | Lr: 4.534e-03, 4.534e-02 | M:0.15415/C:0.20774 | [8, 1, 384, 384] | seg_BCE: 0.15580 seg_UAL_0.57292: 0.05193
+I:9640:17600 136/352 27/50 | Lr: 4.522e-03, 4.522e-02 | M:0.15337/C:0.08804 | [8, 1, 384, 384] | seg_BCE: 0.05937 seg_UAL_0.57469: 0.02867
+I:9660:17600 156/352 27/50 | Lr: 4.511e-03, 4.511e-02 | M:0.15271/C:0.12042 | [8, 1, 384, 384] | seg_BCE: 0.08616 seg_UAL_0.57645: 0.03426
+I:9680:17600 176/352 27/50 | Lr: 4.499e-03, 4.499e-02 | M:0.15091/C:0.16138 | [8, 1, 384, 384] | seg_BCE: 0.12048 seg_UAL_0.57822: 0.04090
+I:9700:17600 196/352 27/50 | Lr: 4.488e-03, 4.488e-02 | M:0.15066/C:0.11946 | [8, 1, 384, 384] | seg_BCE: 0.08659 seg_UAL_0.57998: 0.03286
+I:9720:17600 216/352 27/50 | Lr: 4.477e-03, 4.477e-02 | M:0.14976/C:0.12531 | [8, 1, 384, 384] | seg_BCE: 0.08999 seg_UAL_0.58174: 0.03532
+I:9740:17600 236/352 27/50 | Lr: 4.465e-03, 4.465e-02 | M:0.15267/C:0.19230 | [8, 1, 384, 384] | seg_BCE: 0.14250 seg_UAL_0.58350: 0.04980
+I:9760:17600 256/352 27/50 | Lr: 4.454e-03, 4.454e-02 | M:0.15311/C:0.10243 | [8, 1, 384, 384] | seg_BCE: 0.06890 seg_UAL_0.58526: 0.03353
+I:9780:17600 276/352 27/50 | Lr: 4.443e-03, 4.443e-02 | M:0.15304/C:0.25102 | [8, 1, 384, 384] | seg_BCE: 0.20754 seg_UAL_0.58702: 0.04348
+I:9800:17600 296/352 27/50 | Lr: 4.431e-03, 4.431e-02 | M:0.15406/C:0.17309 | [8, 1, 384, 384] | seg_BCE: 0.11800 seg_UAL_0.58878: 0.05509
+I:9820:17600 316/352 27/50 | Lr: 4.420e-03, 4.420e-02 | M:0.15444/C:0.13196 | [8, 1, 384, 384] | seg_BCE: 0.09831 seg_UAL_0.59053: 0.03365
+I:9840:17600 336/352 27/50 | Lr: 4.409e-03, 4.409e-02 | M:0.15500/C:0.16148 | [8, 1, 384, 384] | seg_BCE: 0.11685 seg_UAL_0.59229: 0.04462
+I:9855:17600 351/352 27/50 | Lr: 4.400e-03, 4.400e-02 | M:0.15524/C:0.13426 | [8, 1, 384, 384] | seg_BCE: 0.10119 seg_UAL_0.59360: 0.03307
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:9860:17600 4/352 28/50 | Lr: 4.397e-03, 4.397e-02 | M:0.14268/C:0.12220 | [8, 1, 384, 384] | seg_BCE: 0.08591 seg_UAL_0.59404: 0.03629
+I:9880:17600 24/352 28/50 | Lr: 4.386e-03, 4.386e-02 | M:0.13956/C:0.18671 | [8, 1, 384, 384] | seg_BCE: 0.14772 seg_UAL_0.59579: 0.03900
+I:9900:17600 44/352 28/50 | Lr: 4.374e-03, 4.374e-02 | M:0.15180/C:0.13878 | [8, 1, 384, 384] | seg_BCE: 0.09672 seg_UAL_0.59755: 0.04205
+I:9920:17600 64/352 28/50 | Lr: 4.363e-03, 4.363e-02 | M:0.15359/C:0.22625 | [8, 1, 384, 384] | seg_BCE: 0.17820 seg_UAL_0.59930: 0.04804
+I:9940:17600 84/352 28/50 | Lr: 4.352e-03, 4.352e-02 | M:0.15056/C:0.18243 | [8, 1, 384, 384] | seg_BCE: 0.13409 seg_UAL_0.60104: 0.04834
+I:9960:17600 104/352 28/50 | Lr: 4.340e-03, 4.340e-02 | M:0.15248/C:0.17125 | [8, 1, 384, 384] | seg_BCE: 0.12981 seg_UAL_0.60279: 0.04144
+I:9980:17600 124/352 28/50 | Lr: 4.329e-03, 4.329e-02 | M:0.14942/C:0.18013 | [8, 1, 384, 384] | seg_BCE: 0.14502 seg_UAL_0.60454: 0.03511
+I:10000:17600 144/352 28/50 | Lr: 4.318e-03, 4.318e-02 | M:0.14808/C:0.20470 | [8, 1, 384, 384] | seg_BCE: 0.16010 seg_UAL_0.60628: 0.04460
+I:10020:17600 164/352 28/50 | Lr: 4.306e-03, 4.306e-02 | M:0.14725/C:0.14079 | [8, 1, 384, 384] | seg_BCE: 0.10920 seg_UAL_0.60803: 0.03158
+I:10040:17600 184/352 28/50 | Lr: 4.295e-03, 4.295e-02 | M:0.14543/C:0.14478 | [8, 1, 384, 384] | seg_BCE: 0.11189 seg_UAL_0.60977: 0.03289
+I:10060:17600 204/352 28/50 | Lr: 4.284e-03, 4.284e-02 | M:0.14538/C:0.13390 | [8, 1, 384, 384] | seg_BCE: 0.10185 seg_UAL_0.61151: 0.03205
+I:10080:17600 224/352 28/50 | Lr: 4.272e-03, 4.272e-02 | M:0.14447/C:0.19361 | [8, 1, 384, 384] | seg_BCE: 0.15616 seg_UAL_0.61325: 0.03745
+I:10100:17600 244/352 28/50 | Lr: 4.261e-03, 4.261e-02 | M:0.14388/C:0.11507 | [8, 1, 384, 384] | seg_BCE: 0.08255 seg_UAL_0.61499: 0.03252
+I:10120:17600 264/352 28/50 | Lr: 4.249e-03, 4.249e-02 | M:0.14344/C:0.11784 | [8, 1, 384, 384] | seg_BCE: 0.08397 seg_UAL_0.61672: 0.03388
+I:10140:17600 284/352 28/50 | Lr: 4.238e-03, 4.238e-02 | M:0.14379/C:0.14279 | [8, 1, 384, 384] | seg_BCE: 0.09496 seg_UAL_0.61846: 0.04783
+I:10160:17600 304/352 28/50 | Lr: 4.227e-03, 4.227e-02 | M:0.14443/C:0.17122 | [8, 1, 384, 384] | seg_BCE: 0.12873 seg_UAL_0.62019: 0.04249
+I:10180:17600 324/352 28/50 | Lr: 4.215e-03, 4.215e-02 | M:0.14556/C:0.20925 | [8, 1, 384, 384] | seg_BCE: 0.16553 seg_UAL_0.62192: 0.04372
+I:10200:17600 344/352 28/50 | Lr: 4.204e-03, 4.204e-02 | M:0.14756/C:0.28090 | [8, 1, 384, 384] | seg_BCE: 0.23032 seg_UAL_0.62365: 0.05058
+I:10207:17600 351/352 28/50 | Lr: 4.200e-03, 4.200e-02 | M:0.14870/C:0.17376 | [8, 1, 384, 384] | seg_BCE: 0.12281 seg_UAL_0.62426: 0.05095
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:10220:17600 12/352 29/50 | Lr: 4.193e-03, 4.193e-02 | M:0.16091/C:0.18901 | [8, 1, 384, 384] | seg_BCE: 0.13717 seg_UAL_0.62538: 0.05184
+I:10240:17600 32/352 29/50 | Lr: 4.181e-03, 4.181e-02 | M:0.16641/C:0.14548 | [8, 1, 384, 384] | seg_BCE: 0.09987 seg_UAL_0.62711: 0.04561
+I:10260:17600 52/352 29/50 | Lr: 4.170e-03, 4.170e-02 | M:0.16408/C:0.16447 | [8, 1, 384, 384] | seg_BCE: 0.13247 seg_UAL_0.62883: 0.03200
+I:10280:17600 72/352 29/50 | Lr: 4.159e-03, 4.159e-02 | M:0.15981/C:0.12321 | [8, 1, 384, 384] | seg_BCE: 0.09357 seg_UAL_0.63056: 0.02964
+I:10300:17600 92/352 29/50 | Lr: 4.147e-03, 4.147e-02 | M:0.15211/C:0.08894 | [8, 1, 384, 384] | seg_BCE: 0.06773 seg_UAL_0.63228: 0.02121
+I:10320:17600 112/352 29/50 | Lr: 4.136e-03, 4.136e-02 | M:0.15270/C:0.09978 | [8, 1, 384, 384] | seg_BCE: 0.07142 seg_UAL_0.63400: 0.02836
+I:10340:17600 132/352 29/50 | Lr: 4.124e-03, 4.124e-02 | M:0.15114/C:0.26590 | [8, 1, 384, 384] | seg_BCE: 0.20005 seg_UAL_0.63572: 0.06585
+I:10360:17600 152/352 29/50 | Lr: 4.113e-03, 4.113e-02 | M:0.14953/C:0.15708 | [8, 1, 384, 384] | seg_BCE: 0.12212 seg_UAL_0.63744: 0.03497
+I:10380:17600 172/352 29/50 | Lr: 4.102e-03, 4.102e-02 | M:0.14815/C:0.13691 | [8, 1, 384, 384] | seg_BCE: 0.10198 seg_UAL_0.63915: 0.03492
+I:10400:17600 192/352 29/50 | Lr: 4.090e-03, 4.090e-02 | M:0.14581/C:0.08502 | [8, 1, 384, 384] | seg_BCE: 0.05191 seg_UAL_0.64087: 0.03311
+I:10420:17600 212/352 29/50 | Lr: 4.079e-03, 4.079e-02 | M:0.14639/C:0.18544 | [8, 1, 384, 384] | seg_BCE: 0.14510 seg_UAL_0.64258: 0.04035
+I:10440:17600 232/352 29/50 | Lr: 4.068e-03, 4.068e-02 | M:0.14745/C:0.13058 | [8, 1, 384, 384] | seg_BCE: 0.09764 seg_UAL_0.64429: 0.03294
+I:10460:17600 252/352 29/50 | Lr: 4.056e-03, 4.056e-02 | M:0.14601/C:0.11826 | [8, 1, 384, 384] | seg_BCE: 0.07770 seg_UAL_0.64600: 0.04056
+I:10480:17600 272/352 29/50 | Lr: 4.045e-03, 4.045e-02 | M:0.14442/C:0.12869 | [8, 1, 384, 384] | seg_BCE: 0.10160 seg_UAL_0.64770: 0.02709
+I:10500:17600 292/352 29/50 | Lr: 4.034e-03, 4.034e-02 | M:0.14395/C:0.09842 | [8, 1, 384, 384] | seg_BCE: 0.06879 seg_UAL_0.64941: 0.02963
+I:10520:17600 312/352 29/50 | Lr: 4.022e-03, 4.022e-02 | M:0.14544/C:0.17227 | [8, 1, 384, 384] | seg_BCE: 0.13809 seg_UAL_0.65111: 0.03418
+I:10540:17600 332/352 29/50 | Lr: 4.011e-03, 4.011e-02 | M:0.14589/C:0.14810 | [8, 1, 384, 384] | seg_BCE: 0.10261 seg_UAL_0.65281: 0.04549
+I:10559:17600 351/352 29/50 | Lr: 4.000e-03, 4.000e-02 | M:0.14566/C:0.19628 | [8, 1, 384, 384] | seg_BCE: 0.13888 seg_UAL_0.65442: 0.05740
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:10560:17600 0/352 30/50 | Lr: 3.999e-03, 3.999e-02 | M:0.09680/C:0.09680 | [8, 1, 384, 384] | seg_BCE: 0.06353 seg_UAL_0.65451: 0.03327
+I:10580:17600 20/352 30/50 | Lr: 3.988e-03, 3.988e-02 | M:0.12928/C:0.17857 | [8, 1, 384, 384] | seg_BCE: 0.14043 seg_UAL_0.65621: 0.03813
+I:10600:17600 40/352 30/50 | Lr: 3.977e-03, 3.977e-02 | M:0.13091/C:0.14564 | [8, 1, 384, 384] | seg_BCE: 0.10592 seg_UAL_0.65790: 0.03972
+I:10620:17600 60/352 30/50 | Lr: 3.965e-03, 3.965e-02 | M:0.12748/C:0.09429 | [8, 1, 384, 384] | seg_BCE: 0.06310 seg_UAL_0.65959: 0.03119
+I:10640:17600 80/352 30/50 | Lr: 3.954e-03, 3.954e-02 | M:0.12509/C:0.13546 | [8, 1, 384, 384] | seg_BCE: 0.10572 seg_UAL_0.66128: 0.02974
+I:10660:17600 100/352 30/50 | Lr: 3.943e-03, 3.943e-02 | M:0.12806/C:0.09937 | [8, 1, 384, 384] | seg_BCE: 0.07261 seg_UAL_0.66297: 0.02676
+I:10680:17600 120/352 30/50 | Lr: 3.931e-03, 3.931e-02 | M:0.13119/C:0.12820 | [8, 1, 384, 384] | seg_BCE: 0.09490 seg_UAL_0.66466: 0.03331
+I:10700:17600 140/352 30/50 | Lr: 3.920e-03, 3.920e-02 | M:0.13086/C:0.06902 | [8, 1, 384, 384] | seg_BCE: 0.04562 seg_UAL_0.66634: 0.02340
+I:10720:17600 160/352 30/50 | Lr: 3.909e-03, 3.909e-02 | M:0.13104/C:0.09107 | [8, 1, 384, 384] | seg_BCE: 0.06352 seg_UAL_0.66802: 0.02755
+I:10740:17600 180/352 30/50 | Lr: 3.897e-03, 3.897e-02 | M:0.13223/C:0.11021 | [8, 1, 384, 384] | seg_BCE: 0.08026 seg_UAL_0.66970: 0.02994
+I:10760:17600 200/352 30/50 | Lr: 3.886e-03, 3.886e-02 | M:0.13407/C:0.13532 | [8, 1, 384, 384] | seg_BCE: 0.09891 seg_UAL_0.67138: 0.03640
+I:10780:17600 220/352 30/50 | Lr: 3.874e-03, 3.874e-02 | M:0.13457/C:0.14172 | [8, 1, 384, 384] | seg_BCE: 0.10880 seg_UAL_0.67306: 0.03292
+I:10800:17600 240/352 30/50 | Lr: 3.863e-03, 3.863e-02 | M:0.13467/C:0.21232 | [8, 1, 384, 384] | seg_BCE: 0.16596 seg_UAL_0.67473: 0.04636
+I:10820:17600 260/352 30/50 | Lr: 3.852e-03, 3.852e-02 | M:0.13476/C:0.07325 | [8, 1, 384, 384] | seg_BCE: 0.04908 seg_UAL_0.67640: 0.02417
+I:10840:17600 280/352 30/50 | Lr: 3.840e-03, 3.840e-02 | M:0.13403/C:0.08134 | [8, 1, 384, 384] | seg_BCE: 0.05707 seg_UAL_0.67807: 0.02427
+I:10860:17600 300/352 30/50 | Lr: 3.829e-03, 3.829e-02 | M:0.13339/C:0.10921 | [8, 1, 384, 384] | seg_BCE: 0.07475 seg_UAL_0.67974: 0.03446
+I:10880:17600 320/352 30/50 | Lr: 3.818e-03, 3.818e-02 | M:0.13310/C:0.09907 | [8, 1, 384, 384] | seg_BCE: 0.07348 seg_UAL_0.68140: 0.02560
+I:10900:17600 340/352 30/50 | Lr: 3.806e-03, 3.806e-02 | M:0.13356/C:0.16714 | [8, 1, 384, 384] | seg_BCE: 0.13234 seg_UAL_0.68307: 0.03480
+I:10911:17600 351/352 30/50 | Lr: 3.800e-03, 3.800e-02 | M:0.13394/C:0.19421 | [8, 1, 384, 384] | seg_BCE: 0.16180 seg_UAL_0.68398: 0.03240
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:10920:17600 8/352 31/50 | Lr: 3.795e-03, 3.795e-02 | M:0.09616/C:0.03838 | [8, 1, 384, 384] | seg_BCE: 0.02432 seg_UAL_0.68473: 0.01406
+I:10940:17600 28/352 31/50 | Lr: 3.784e-03, 3.784e-02 | M:0.12491/C:0.10762 | [8, 1, 384, 384] | seg_BCE: 0.07989 seg_UAL_0.68638: 0.02773
+I:10960:17600 48/352 31/50 | Lr: 3.772e-03, 3.772e-02 | M:0.13294/C:0.23320 | [8, 1, 384, 384] | seg_BCE: 0.17620 seg_UAL_0.68804: 0.05699
+I:10980:17600 68/352 31/50 | Lr: 3.761e-03, 3.761e-02 | M:0.14174/C:0.24399 | [8, 1, 384, 384] | seg_BCE: 0.20264 seg_UAL_0.68969: 0.04136
+I:11000:17600 88/352 31/50 | Lr: 3.749e-03, 3.749e-02 | M:0.14571/C:0.20541 | [8, 1, 384, 384] | seg_BCE: 0.15436 seg_UAL_0.69134: 0.05105
+I:11020:17600 108/352 31/50 | Lr: 3.738e-03, 3.738e-02 | M:0.14711/C:0.15904 | [8, 1, 384, 384] | seg_BCE: 0.12506 seg_UAL_0.69299: 0.03398
+I:11040:17600 128/352 31/50 | Lr: 3.727e-03, 3.727e-02 | M:0.14438/C:0.08279 | [8, 1, 384, 384] | seg_BCE: 0.05558 seg_UAL_0.69464: 0.02721
+I:11060:17600 148/352 31/50 | Lr: 3.715e-03, 3.715e-02 | M:0.14605/C:0.12257 | [8, 1, 384, 384] | seg_BCE: 0.08199 seg_UAL_0.69628: 0.04059
+I:11080:17600 168/352 31/50 | Lr: 3.704e-03, 3.704e-02 | M:0.14477/C:0.13517 | [8, 1, 384, 384] | seg_BCE: 0.10468 seg_UAL_0.69792: 0.03049
+I:11100:17600 188/352 31/50 | Lr: 3.693e-03, 3.693e-02 | M:0.14421/C:0.10240 | [8, 1, 384, 384] | seg_BCE: 0.07372 seg_UAL_0.69956: 0.02868
+I:11120:17600 208/352 31/50 | Lr: 3.681e-03, 3.681e-02 | M:0.14198/C:0.07766 | [8, 1, 384, 384] | seg_BCE: 0.05768 seg_UAL_0.70119: 0.01998
+I:11140:17600 228/352 31/50 | Lr: 3.670e-03, 3.670e-02 | M:0.14082/C:0.08991 | [8, 1, 384, 384] | seg_BCE: 0.06502 seg_UAL_0.70282: 0.02489
+I:11160:17600 248/352 31/50 | Lr: 3.659e-03, 3.659e-02 | M:0.13937/C:0.11140 | [8, 1, 384, 384] | seg_BCE: 0.08034 seg_UAL_0.70445: 0.03106
+I:11180:17600 268/352 31/50 | Lr: 3.647e-03, 3.647e-02 | M:0.13788/C:0.10665 | [8, 1, 384, 384] | seg_BCE: 0.08011 seg_UAL_0.70608: 0.02654
+I:11200:17600 288/352 31/50 | Lr: 3.636e-03, 3.636e-02 | M:0.13698/C:0.09072 | [8, 1, 384, 384] | seg_BCE: 0.06224 seg_UAL_0.70771: 0.02848
+I:11220:17600 308/352 31/50 | Lr: 3.624e-03, 3.624e-02 | M:0.13716/C:0.16862 | [8, 1, 384, 384] | seg_BCE: 0.12415 seg_UAL_0.70933: 0.04447
+I:11240:17600 328/352 31/50 | Lr: 3.613e-03, 3.613e-02 | M:0.13730/C:0.20836 | [8, 1, 384, 384] | seg_BCE: 0.15412 seg_UAL_0.71095: 0.05424
+I:11260:17600 348/352 31/50 | Lr: 3.602e-03, 3.602e-02 | M:0.13741/C:0.10918 | [8, 1, 384, 384] | seg_BCE: 0.08250 seg_UAL_0.71257: 0.02668
+I:11263:17600 351/352 31/50 | Lr: 3.600e-03, 3.600e-02 | M:0.13732/C:0.12489 | [8, 1, 384, 384] | seg_BCE: 0.08746 seg_UAL_0.71281: 0.03743
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:11280:17600 16/352 32/50 | Lr: 3.590e-03, 3.590e-02 | M:0.13257/C:0.22793 | [8, 1, 384, 384] | seg_BCE: 0.18685 seg_UAL_0.71418: 0.04109
+I:11300:17600 36/352 32/50 | Lr: 3.579e-03, 3.579e-02 | M:0.12426/C:0.08199 | [8, 1, 384, 384] | seg_BCE: 0.05567 seg_UAL_0.71579: 0.02632
+I:11320:17600 56/352 32/50 | Lr: 3.568e-03, 3.568e-02 | M:0.12384/C:0.10577 | [8, 1, 384, 384] | seg_BCE: 0.07590 seg_UAL_0.71740: 0.02986
+I:11340:17600 76/352 32/50 | Lr: 3.556e-03, 3.556e-02 | M:0.12479/C:0.11346 | [8, 1, 384, 384] | seg_BCE: 0.09040 seg_UAL_0.71901: 0.02306
+I:11360:17600 96/352 32/50 | Lr: 3.545e-03, 3.545e-02 | M:0.13131/C:0.19105 | [8, 1, 384, 384] | seg_BCE: 0.14411 seg_UAL_0.72061: 0.04694
+I:11380:17600 116/352 32/50 | Lr: 3.534e-03, 3.534e-02 | M:0.13051/C:0.09312 | [8, 1, 384, 384] | seg_BCE: 0.06539 seg_UAL_0.72221: 0.02774
+I:11400:17600 136/352 32/50 | Lr: 3.522e-03, 3.522e-02 | M:0.12873/C:0.07230 | [8, 1, 384, 384] | seg_BCE: 0.05054 seg_UAL_0.72381: 0.02176
+I:11420:17600 156/352 32/50 | Lr: 3.511e-03, 3.511e-02 | M:0.12799/C:0.09495 | [8, 1, 384, 384] | seg_BCE: 0.07006 seg_UAL_0.72540: 0.02489
+I:11440:17600 176/352 32/50 | Lr: 3.499e-03, 3.499e-02 | M:0.12876/C:0.28295 | [8, 1, 384, 384] | seg_BCE: 0.20372 seg_UAL_0.72700: 0.07922
+I:11460:17600 196/352 32/50 | Lr: 3.488e-03, 3.488e-02 | M:0.13025/C:0.23300 | [8, 1, 384, 384] | seg_BCE: 0.18698 seg_UAL_0.72858: 0.04602
+I:11480:17600 216/352 32/50 | Lr: 3.477e-03, 3.477e-02 | M:0.13173/C:0.19595 | [8, 1, 384, 384] | seg_BCE: 0.15662 seg_UAL_0.73017: 0.03933
+I:11500:17600 236/352 32/50 | Lr: 3.465e-03, 3.465e-02 | M:0.13033/C:0.14879 | [8, 1, 384, 384] | seg_BCE: 0.11922 seg_UAL_0.73175: 0.02956
+I:11520:17600 256/352 32/50 | Lr: 3.454e-03, 3.454e-02 | M:0.12920/C:0.15989 | [8, 1, 384, 384] | seg_BCE: 0.11647 seg_UAL_0.73333: 0.04342
+I:11540:17600 276/352 32/50 | Lr: 3.443e-03, 3.443e-02 | M:0.12897/C:0.06668 | [8, 1, 384, 384] | seg_BCE: 0.04338 seg_UAL_0.73491: 0.02331
+I:11560:17600 296/352 32/50 | Lr: 3.431e-03, 3.431e-02 | M:0.12917/C:0.07969 | [8, 1, 384, 384] | seg_BCE: 0.05191 seg_UAL_0.73649: 0.02778
+I:11580:17600 316/352 32/50 | Lr: 3.420e-03, 3.420e-02 | M:0.12846/C:0.09479 | [8, 1, 384, 384] | seg_BCE: 0.07069 seg_UAL_0.73806: 0.02410
+I:11600:17600 336/352 32/50 | Lr: 3.409e-03, 3.409e-02 | M:0.12784/C:0.09390 | [8, 1, 384, 384] | seg_BCE: 0.06633 seg_UAL_0.73962: 0.02757
+I:11615:17600 351/352 32/50 | Lr: 3.400e-03, 3.400e-02 | M:0.12831/C:0.13691 | [8, 1, 384, 384] | seg_BCE: 0.10328 seg_UAL_0.74080: 0.03363
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:11620:17600 4/352 33/50 | Lr: 3.397e-03, 3.397e-02 | M:0.12121/C:0.11740 | [8, 1, 384, 384] | seg_BCE: 0.08469 seg_UAL_0.74119: 0.03272
+I:11640:17600 24/352 33/50 | Lr: 3.386e-03, 3.386e-02 | M:0.10733/C:0.07483 | [8, 1, 384, 384] | seg_BCE: 0.05152 seg_UAL_0.74275: 0.02331
+I:11660:17600 44/352 33/50 | Lr: 3.374e-03, 3.374e-02 | M:0.10768/C:0.14010 | [8, 1, 384, 384] | seg_BCE: 0.11282 seg_UAL_0.74431: 0.02728
+I:11680:17600 64/352 33/50 | Lr: 3.363e-03, 3.363e-02 | M:0.11407/C:0.14742 | [8, 1, 384, 384] | seg_BCE: 0.11882 seg_UAL_0.74587: 0.02859
+I:11700:17600 84/352 33/50 | Lr: 3.352e-03, 3.352e-02 | M:0.11217/C:0.13234 | [8, 1, 384, 384] | seg_BCE: 0.09694 seg_UAL_0.74742: 0.03540
+I:11720:17600 104/352 33/50 | Lr: 3.340e-03, 3.340e-02 | M:0.11292/C:0.09798 | [8, 1, 384, 384] | seg_BCE: 0.07056 seg_UAL_0.74897: 0.02742
+I:11740:17600 124/352 33/50 | Lr: 3.329e-03, 3.329e-02 | M:0.11330/C:0.08856 | [8, 1, 384, 384] | seg_BCE: 0.05837 seg_UAL_0.75052: 0.03019
+I:11760:17600 144/352 33/50 | Lr: 3.318e-03, 3.318e-02 | M:0.11268/C:0.09292 | [8, 1, 384, 384] | seg_BCE: 0.06631 seg_UAL_0.75206: 0.02661
+I:11780:17600 164/352 33/50 | Lr: 3.306e-03, 3.306e-02 | M:0.11370/C:0.17606 | [8, 1, 384, 384] | seg_BCE: 0.13227 seg_UAL_0.75360: 0.04379
+I:11800:17600 184/352 33/50 | Lr: 3.295e-03, 3.295e-02 | M:0.11412/C:0.13555 | [8, 1, 384, 384] | seg_BCE: 0.10293 seg_UAL_0.75514: 0.03262
+I:11820:17600 204/352 33/50 | Lr: 3.284e-03, 3.284e-02 | M:0.11771/C:0.12643 | [8, 1, 384, 384] | seg_BCE: 0.08700 seg_UAL_0.75667: 0.03943
+I:11840:17600 224/352 33/50 | Lr: 3.272e-03, 3.272e-02 | M:0.12241/C:0.13156 | [8, 1, 384, 384] | seg_BCE: 0.09251 seg_UAL_0.75820: 0.03904
+I:11860:17600 244/352 33/50 | Lr: 3.261e-03, 3.261e-02 | M:0.12464/C:0.20531 | [8, 1, 384, 384] | seg_BCE: 0.15508 seg_UAL_0.75973: 0.05023
+I:11880:17600 264/352 33/50 | Lr: 3.249e-03, 3.249e-02 | M:0.12922/C:0.16733 | [8, 1, 384, 384] | seg_BCE: 0.13085 seg_UAL_0.76125: 0.03649
+I:11900:17600 284/352 33/50 | Lr: 3.238e-03, 3.238e-02 | M:0.13215/C:0.13773 | [8, 1, 384, 384] | seg_BCE: 0.09947 seg_UAL_0.76277: 0.03826
+I:11920:17600 304/352 33/50 | Lr: 3.227e-03, 3.227e-02 | M:0.13312/C:0.15511 | [8, 1, 384, 384] | seg_BCE: 0.12045 seg_UAL_0.76429: 0.03467
+I:11940:17600 324/352 33/50 | Lr: 3.215e-03, 3.215e-02 | M:0.13397/C:0.16122 | [8, 1, 384, 384] | seg_BCE: 0.12674 seg_UAL_0.76580: 0.03448
+I:11960:17600 344/352 33/50 | Lr: 3.204e-03, 3.204e-02 | M:0.13453/C:0.15345 | [8, 1, 384, 384] | seg_BCE: 0.11747 seg_UAL_0.76731: 0.03598
+I:11967:17600 351/352 33/50 | Lr: 3.200e-03, 3.200e-02 | M:0.13484/C:0.09967 | [8, 1, 384, 384] | seg_BCE: 0.06500 seg_UAL_0.76784: 0.03467
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:11980:17600 12/352 34/50 | Lr: 3.193e-03, 3.193e-02 | M:0.12034/C:0.08528 | [8, 1, 384, 384] | seg_BCE: 0.05997 seg_UAL_0.76882: 0.02531
+I:12000:17600 32/352 34/50 | Lr: 3.181e-03, 3.181e-02 | M:0.12699/C:0.10765 | [8, 1, 384, 384] | seg_BCE: 0.08050 seg_UAL_0.77032: 0.02715
+I:12020:17600 52/352 34/50 | Lr: 3.170e-03, 3.170e-02 | M:0.12316/C:0.07906 | [8, 1, 384, 384] | seg_BCE: 0.05518 seg_UAL_0.77182: 0.02388
+I:12040:17600 72/352 34/50 | Lr: 3.159e-03, 3.159e-02 | M:0.12193/C:0.09176 | [8, 1, 384, 384] | seg_BCE: 0.06610 seg_UAL_0.77332: 0.02567
+I:12060:17600 92/352 34/50 | Lr: 3.147e-03, 3.147e-02 | M:0.12238/C:0.17043 | [8, 1, 384, 384] | seg_BCE: 0.13346 seg_UAL_0.77481: 0.03697
+I:12080:17600 112/352 34/50 | Lr: 3.136e-03, 3.136e-02 | M:0.12437/C:0.14794 | [8, 1, 384, 384] | seg_BCE: 0.10806 seg_UAL_0.77630: 0.03989
+I:12100:17600 132/352 34/50 | Lr: 3.124e-03, 3.124e-02 | M:0.12591/C:0.13463 | [8, 1, 384, 384] | seg_BCE: 0.09854 seg_UAL_0.77779: 0.03609
+I:12120:17600 152/352 34/50 | Lr: 3.113e-03, 3.113e-02 | M:0.12831/C:0.18338 | [8, 1, 384, 384] | seg_BCE: 0.12523 seg_UAL_0.77927: 0.05814
+I:12140:17600 172/352 34/50 | Lr: 3.102e-03, 3.102e-02 | M:0.12770/C:0.10021 | [8, 1, 384, 384] | seg_BCE: 0.07393 seg_UAL_0.78075: 0.02628
+I:12160:17600 192/352 34/50 | Lr: 3.090e-03, 3.090e-02 | M:0.12679/C:0.12068 | [8, 1, 384, 384] | seg_BCE: 0.08562 seg_UAL_0.78222: 0.03506
+I:12180:17600 212/352 34/50 | Lr: 3.079e-03, 3.079e-02 | M:0.12619/C:0.08772 | [8, 1, 384, 384] | seg_BCE: 0.06174 seg_UAL_0.78369: 0.02598
+I:12200:17600 232/352 34/50 | Lr: 3.068e-03, 3.068e-02 | M:0.12624/C:0.09255 | [8, 1, 384, 384] | seg_BCE: 0.06014 seg_UAL_0.78516: 0.03241
+I:12220:17600 252/352 34/50 | Lr: 3.056e-03, 3.056e-02 | M:0.12650/C:0.07320 | [8, 1, 384, 384] | seg_BCE: 0.04496 seg_UAL_0.78663: 0.02824
+I:12240:17600 272/352 34/50 | Lr: 3.045e-03, 3.045e-02 | M:0.12652/C:0.16479 | [8, 1, 384, 384] | seg_BCE: 0.12624 seg_UAL_0.78809: 0.03855
+I:12260:17600 292/352 34/50 | Lr: 3.034e-03, 3.034e-02 | M:0.12714/C:0.09571 | [8, 1, 384, 384] | seg_BCE: 0.06719 seg_UAL_0.78954: 0.02852
+I:12280:17600 312/352 34/50 | Lr: 3.022e-03, 3.022e-02 | M:0.12826/C:0.08180 | [8, 1, 384, 384] | seg_BCE: 0.05509 seg_UAL_0.79100: 0.02670
+I:12300:17600 332/352 34/50 | Lr: 3.011e-03, 3.011e-02 | M:0.12846/C:0.09202 | [8, 1, 384, 384] | seg_BCE: 0.06085 seg_UAL_0.79245: 0.03117
+I:12319:17600 351/352 34/50 | Lr: 3.000e-03, 3.000e-02 | M:0.12895/C:0.11327 | [8, 1, 384, 384] | seg_BCE: 0.07912 seg_UAL_0.79382: 0.03415
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:12320:17600 0/352 35/50 | Lr: 2.999e-03, 2.999e-02 | M:0.18176/C:0.18176 | [8, 1, 384, 384] | seg_BCE: 0.12195 seg_UAL_0.79389: 0.05980
+I:12340:17600 20/352 35/50 | Lr: 2.988e-03, 2.988e-02 | M:0.14296/C:0.07546 | [8, 1, 384, 384] | seg_BCE: 0.05283 seg_UAL_0.79533: 0.02264
+I:12360:17600 40/352 35/50 | Lr: 2.977e-03, 2.977e-02 | M:0.13128/C:0.09343 | [8, 1, 384, 384] | seg_BCE: 0.07106 seg_UAL_0.79677: 0.02237
+I:12380:17600 60/352 35/50 | Lr: 2.965e-03, 2.965e-02 | M:0.12919/C:0.07879 | [8, 1, 384, 384] | seg_BCE: 0.04930 seg_UAL_0.79821: 0.02949
+I:12400:17600 80/352 35/50 | Lr: 2.954e-03, 2.954e-02 | M:0.12639/C:0.06586 | [8, 1, 384, 384] | seg_BCE: 0.04715 seg_UAL_0.79964: 0.01872
+I:12420:17600 100/352 35/50 | Lr: 2.943e-03, 2.943e-02 | M:0.12339/C:0.10551 | [8, 1, 384, 384] | seg_BCE: 0.07219 seg_UAL_0.80107: 0.03331
+I:12440:17600 120/352 35/50 | Lr: 2.931e-03, 2.931e-02 | M:0.12165/C:0.10194 | [8, 1, 384, 384] | seg_BCE: 0.07453 seg_UAL_0.80249: 0.02741
+I:12460:17600 140/352 35/50 | Lr: 2.920e-03, 2.920e-02 | M:0.11975/C:0.08617 | [8, 1, 384, 384] | seg_BCE: 0.05675 seg_UAL_0.80391: 0.02943
+I:12480:17600 160/352 35/50 | Lr: 2.909e-03, 2.909e-02 | M:0.11878/C:0.07222 | [8, 1, 384, 384] | seg_BCE: 0.05130 seg_UAL_0.80532: 0.02093
+I:12500:17600 180/352 35/50 | Lr: 2.897e-03, 2.897e-02 | M:0.11774/C:0.13300 | [8, 1, 384, 384] | seg_BCE: 0.10025 seg_UAL_0.80674: 0.03275
+I:12520:17600 200/352 35/50 | Lr: 2.886e-03, 2.886e-02 | M:0.11716/C:0.12284 | [8, 1, 384, 384] | seg_BCE: 0.08917 seg_UAL_0.80814: 0.03367
+I:12540:17600 220/352 35/50 | Lr: 2.874e-03, 2.874e-02 | M:0.11585/C:0.08027 | [8, 1, 384, 384] | seg_BCE: 0.05206 seg_UAL_0.80955: 0.02821
+I:12560:17600 240/352 35/50 | Lr: 2.863e-03, 2.863e-02 | M:0.11543/C:0.15139 | [8, 1, 384, 384] | seg_BCE: 0.11927 seg_UAL_0.81095: 0.03212
+I:12580:17600 260/352 35/50 | Lr: 2.852e-03, 2.852e-02 | M:0.11454/C:0.09369 | [8, 1, 384, 384] | seg_BCE: 0.06591 seg_UAL_0.81234: 0.02778
+I:12600:17600 280/352 35/50 | Lr: 2.840e-03, 2.840e-02 | M:0.11439/C:0.15209 | [8, 1, 384, 384] | seg_BCE: 0.11968 seg_UAL_0.81373: 0.03242
+I:12620:17600 300/352 35/50 | Lr: 2.829e-03, 2.829e-02 | M:0.11510/C:0.08760 | [8, 1, 384, 384] | seg_BCE: 0.06231 seg_UAL_0.81512: 0.02530
+I:12640:17600 320/352 35/50 | Lr: 2.818e-03, 2.818e-02 | M:0.11410/C:0.08494 | [8, 1, 384, 384] | seg_BCE: 0.05968 seg_UAL_0.81651: 0.02527
+I:12660:17600 340/352 35/50 | Lr: 2.806e-03, 2.806e-02 | M:0.11526/C:0.09729 | [8, 1, 384, 384] | seg_BCE: 0.05867 seg_UAL_0.81789: 0.03863
+I:12671:17600 351/352 35/50 | Lr: 2.800e-03, 2.800e-02 | M:0.11517/C:0.10424 | [8, 1, 384, 384] | seg_BCE: 0.08171 seg_UAL_0.81864: 0.02253
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:12680:17600 8/352 36/50 | Lr: 2.795e-03, 2.795e-02 | M:0.09442/C:0.06919 | [8, 1, 384, 384] | seg_BCE: 0.04809 seg_UAL_0.81926: 0.02110
+I:12700:17600 28/352 36/50 | Lr: 2.784e-03, 2.784e-02 | M:0.10370/C:0.11043 | [8, 1, 384, 384] | seg_BCE: 0.08401 seg_UAL_0.82063: 0.02642
+I:12720:17600 48/352 36/50 | Lr: 2.772e-03, 2.772e-02 | M:0.10913/C:0.12103 | [8, 1, 384, 384] | seg_BCE: 0.09107 seg_UAL_0.82200: 0.02996
+I:12740:17600 68/352 36/50 | Lr: 2.761e-03, 2.761e-02 | M:0.11081/C:0.07391 | [8, 1, 384, 384] | seg_BCE: 0.04887 seg_UAL_0.82336: 0.02505
+I:12760:17600 88/352 36/50 | Lr: 2.749e-03, 2.749e-02 | M:0.10822/C:0.10727 | [8, 1, 384, 384] | seg_BCE: 0.08102 seg_UAL_0.82472: 0.02625
+I:12780:17600 108/352 36/50 | Lr: 2.738e-03, 2.738e-02 | M:0.10992/C:0.14514 | [8, 1, 384, 384] | seg_BCE: 0.07647 seg_UAL_0.82608: 0.06867
+I:12800:17600 128/352 36/50 | Lr: 2.727e-03, 2.727e-02 | M:0.11044/C:0.09946 | [8, 1, 384, 384] | seg_BCE: 0.07146 seg_UAL_0.82743: 0.02801
+I:12820:17600 148/352 36/50 | Lr: 2.715e-03, 2.715e-02 | M:0.10784/C:0.07540 | [8, 1, 384, 384] | seg_BCE: 0.05393 seg_UAL_0.82878: 0.02147
+I:12840:17600 168/352 36/50 | Lr: 2.704e-03, 2.704e-02 | M:0.10810/C:0.11287 | [8, 1, 384, 384] | seg_BCE: 0.08325 seg_UAL_0.83012: 0.02962
+I:12860:17600 188/352 36/50 | Lr: 2.693e-03, 2.693e-02 | M:0.10742/C:0.09341 | [8, 1, 384, 384] | seg_BCE: 0.06710 seg_UAL_0.83146: 0.02631
+I:12880:17600 208/352 36/50 | Lr: 2.681e-03, 2.681e-02 | M:0.10666/C:0.09330 | [8, 1, 384, 384] | seg_BCE: 0.06715 seg_UAL_0.83279: 0.02615
+I:12900:17600 228/352 36/50 | Lr: 2.670e-03, 2.670e-02 | M:0.10636/C:0.14144 | [8, 1, 384, 384] | seg_BCE: 0.10281 seg_UAL_0.83412: 0.03862
+I:12920:17600 248/352 36/50 | Lr: 2.659e-03, 2.659e-02 | M:0.10712/C:0.14736 | [8, 1, 384, 384] | seg_BCE: 0.11429 seg_UAL_0.83545: 0.03308
+I:12940:17600 268/352 36/50 | Lr: 2.647e-03, 2.647e-02 | M:0.10773/C:0.12860 | [8, 1, 384, 384] | seg_BCE: 0.09726 seg_UAL_0.83677: 0.03133
+I:12960:17600 288/352 36/50 | Lr: 2.636e-03, 2.636e-02 | M:0.10799/C:0.14633 | [8, 1, 384, 384] | seg_BCE: 0.11806 seg_UAL_0.83809: 0.02827
+I:12980:17600 308/352 36/50 | Lr: 2.624e-03, 2.624e-02 | M:0.10750/C:0.16120 | [8, 1, 384, 384] | seg_BCE: 0.12343 seg_UAL_0.83940: 0.03777
+I:13000:17600 328/352 36/50 | Lr: 2.613e-03, 2.613e-02 | M:0.10736/C:0.09614 | [8, 1, 384, 384] | seg_BCE: 0.07370 seg_UAL_0.84071: 0.02244
+I:13020:17600 348/352 36/50 | Lr: 2.602e-03, 2.602e-02 | M:0.10779/C:0.07392 | [8, 1, 384, 384] | seg_BCE: 0.05206 seg_UAL_0.84201: 0.02186
+I:13023:17600 351/352 36/50 | Lr: 2.600e-03, 2.600e-02 | M:0.10779/C:0.08611 | [8, 1, 384, 384] | seg_BCE: 0.06295 seg_UAL_0.84221: 0.02317
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:13040:17600 16/352 37/50 | Lr: 2.590e-03, 2.590e-02 | M:0.11052/C:0.12777 | [8, 1, 384, 384] | seg_BCE: 0.09887 seg_UAL_0.84331: 0.02890
+I:13060:17600 36/352 37/50 | Lr: 2.579e-03, 2.579e-02 | M:0.11176/C:0.23517 | [8, 1, 384, 384] | seg_BCE: 0.19050 seg_UAL_0.84461: 0.04467
+I:13080:17600 56/352 37/50 | Lr: 2.568e-03, 2.568e-02 | M:0.11468/C:0.20227 | [8, 1, 384, 384] | seg_BCE: 0.17173 seg_UAL_0.84590: 0.03054
+I:13100:17600 76/352 37/50 | Lr: 2.556e-03, 2.556e-02 | M:0.11115/C:0.10806 | [8, 1, 384, 384] | seg_BCE: 0.07621 seg_UAL_0.84719: 0.03185
+I:13120:17600 96/352 37/50 | Lr: 2.545e-03, 2.545e-02 | M:0.10657/C:0.08894 | [8, 1, 384, 384] | seg_BCE: 0.06712 seg_UAL_0.84847: 0.02182
+I:13140:17600 116/352 37/50 | Lr: 2.534e-03, 2.534e-02 | M:0.10677/C:0.09260 | [8, 1, 384, 384] | seg_BCE: 0.06532 seg_UAL_0.84975: 0.02728
+I:13160:17600 136/352 37/50 | Lr: 2.522e-03, 2.522e-02 | M:0.11006/C:0.12668 | [8, 1, 384, 384] | seg_BCE: 0.09267 seg_UAL_0.85102: 0.03401
+I:13180:17600 156/352 37/50 | Lr: 2.511e-03, 2.511e-02 | M:0.11171/C:0.12697 | [8, 1, 384, 384] | seg_BCE: 0.09449 seg_UAL_0.85229: 0.03248
+I:13200:17600 176/352 37/50 | Lr: 2.499e-03, 2.499e-02 | M:0.11296/C:0.15864 | [8, 1, 384, 384] | seg_BCE: 0.12109 seg_UAL_0.85355: 0.03755
+I:13220:17600 196/352 37/50 | Lr: 2.488e-03, 2.488e-02 | M:0.11352/C:0.15502 | [8, 1, 384, 384] | seg_BCE: 0.12718 seg_UAL_0.85481: 0.02784
+I:13240:17600 216/352 37/50 | Lr: 2.477e-03, 2.477e-02 | M:0.11408/C:0.13692 | [8, 1, 384, 384] | seg_BCE: 0.10325 seg_UAL_0.85607: 0.03367
+I:13260:17600 236/352 37/50 | Lr: 2.465e-03, 2.465e-02 | M:0.11340/C:0.05097 | [8, 1, 384, 384] | seg_BCE: 0.03221 seg_UAL_0.85732: 0.01876
+I:13280:17600 256/352 37/50 | Lr: 2.454e-03, 2.454e-02 | M:0.11371/C:0.10463 | [8, 1, 384, 384] | seg_BCE: 0.07318 seg_UAL_0.85857: 0.03145
+I:13300:17600 276/352 37/50 | Lr: 2.443e-03, 2.443e-02 | M:0.11282/C:0.07972 | [8, 1, 384, 384] | seg_BCE: 0.05878 seg_UAL_0.85981: 0.02094
+I:13320:17600 296/352 37/50 | Lr: 2.431e-03, 2.431e-02 | M:0.11247/C:0.11211 | [8, 1, 384, 384] | seg_BCE: 0.08280 seg_UAL_0.86104: 0.02932
+I:13340:17600 316/352 37/50 | Lr: 2.420e-03, 2.420e-02 | M:0.11270/C:0.08800 | [8, 1, 384, 384] | seg_BCE: 0.06306 seg_UAL_0.86228: 0.02495
+I:13360:17600 336/352 37/50 | Lr: 2.409e-03, 2.409e-02 | M:0.11199/C:0.08122 | [8, 1, 384, 384] | seg_BCE: 0.05580 seg_UAL_0.86351: 0.02542
+I:13375:17600 351/352 37/50 | Lr: 2.400e-03, 2.400e-02 | M:0.11200/C:0.11636 | [8, 1, 384, 384] | seg_BCE: 0.08804 seg_UAL_0.86442: 0.02832
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:13380:17600 4/352 38/50 | Lr: 2.397e-03, 2.397e-02 | M:0.09202/C:0.09623 | [8, 1, 384, 384] | seg_BCE: 0.06994 seg_UAL_0.86473: 0.02629
+I:13400:17600 24/352 38/50 | Lr: 2.386e-03, 2.386e-02 | M:0.10264/C:0.13036 | [8, 1, 384, 384] | seg_BCE: 0.09767 seg_UAL_0.86595: 0.03269
+I:13420:17600 44/352 38/50 | Lr: 2.374e-03, 2.374e-02 | M:0.09943/C:0.11901 | [8, 1, 384, 384] | seg_BCE: 0.08869 seg_UAL_0.86716: 0.03032
+I:13440:17600 64/352 38/50 | Lr: 2.363e-03, 2.363e-02 | M:0.10425/C:0.22710 | [8, 1, 384, 384] | seg_BCE: 0.18960 seg_UAL_0.86837: 0.03750
+I:13460:17600 84/352 38/50 | Lr: 2.352e-03, 2.352e-02 | M:0.10340/C:0.10981 | [8, 1, 384, 384] | seg_BCE: 0.08134 seg_UAL_0.86958: 0.02847
+I:13480:17600 104/352 38/50 | Lr: 2.340e-03, 2.340e-02 | M:0.10075/C:0.13701 | [8, 1, 384, 384] | seg_BCE: 0.11220 seg_UAL_0.87078: 0.02481
+I:13500:17600 124/352 38/50 | Lr: 2.329e-03, 2.329e-02 | M:0.10435/C:0.10448 | [8, 1, 384, 384] | seg_BCE: 0.07520 seg_UAL_0.87197: 0.02928
+I:13520:17600 144/352 38/50 | Lr: 2.318e-03, 2.318e-02 | M:0.10697/C:0.08644 | [8, 1, 384, 384] | seg_BCE: 0.06203 seg_UAL_0.87316: 0.02440
+I:13540:17600 164/352 38/50 | Lr: 2.306e-03, 2.306e-02 | M:0.11013/C:0.09476 | [8, 1, 384, 384] | seg_BCE: 0.06752 seg_UAL_0.87435: 0.02724
+I:13560:17600 184/352 38/50 | Lr: 2.295e-03, 2.295e-02 | M:0.11069/C:0.09013 | [8, 1, 384, 384] | seg_BCE: 0.06804 seg_UAL_0.87553: 0.02209
+I:13580:17600 204/352 38/50 | Lr: 2.284e-03, 2.284e-02 | M:0.11054/C:0.07246 | [8, 1, 384, 384] | seg_BCE: 0.04944 seg_UAL_0.87670: 0.02301
+I:13600:17600 224/352 38/50 | Lr: 2.272e-03, 2.272e-02 | M:0.11070/C:0.15841 | [8, 1, 384, 384] | seg_BCE: 0.12271 seg_UAL_0.87787: 0.03570
+I:13620:17600 244/352 38/50 | Lr: 2.261e-03, 2.261e-02 | M:0.11036/C:0.11528 | [8, 1, 384, 384] | seg_BCE: 0.08687 seg_UAL_0.87904: 0.02841
+I:13640:17600 264/352 38/50 | Lr: 2.249e-03, 2.249e-02 | M:0.11013/C:0.11061 | [8, 1, 384, 384] | seg_BCE: 0.08241 seg_UAL_0.88020: 0.02820
+I:13660:17600 284/352 38/50 | Lr: 2.238e-03, 2.238e-02 | M:0.10896/C:0.07900 | [8, 1, 384, 384] | seg_BCE: 0.05886 seg_UAL_0.88136: 0.02014
+I:13680:17600 304/352 38/50 | Lr: 2.227e-03, 2.227e-02 | M:0.10924/C:0.10723 | [8, 1, 384, 384] | seg_BCE: 0.06118 seg_UAL_0.88251: 0.04605
+I:13700:17600 324/352 38/50 | Lr: 2.215e-03, 2.215e-02 | M:0.10884/C:0.11442 | [8, 1, 384, 384] | seg_BCE: 0.08965 seg_UAL_0.88366: 0.02476
+I:13720:17600 344/352 38/50 | Lr: 2.204e-03, 2.204e-02 | M:0.10862/C:0.12293 | [8, 1, 384, 384] | seg_BCE: 0.09549 seg_UAL_0.88480: 0.02745
+I:13727:17600 351/352 38/50 | Lr: 2.200e-03, 2.200e-02 | M:0.10840/C:0.11090 | [8, 1, 384, 384] | seg_BCE: 0.07465 seg_UAL_0.88520: 0.03625
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:13740:17600 12/352 39/50 | Lr: 2.193e-03, 2.193e-02 | M:0.10431/C:0.12030 | [8, 1, 384, 384] | seg_BCE: 0.09351 seg_UAL_0.88594: 0.02678
+I:13760:17600 32/352 39/50 | Lr: 2.181e-03, 2.181e-02 | M:0.09653/C:0.11637 | [8, 1, 384, 384] | seg_BCE: 0.09011 seg_UAL_0.88707: 0.02626
+I:13780:17600 52/352 39/50 | Lr: 2.170e-03, 2.170e-02 | M:0.09670/C:0.12086 | [8, 1, 384, 384] | seg_BCE: 0.09084 seg_UAL_0.88820: 0.03002
+I:13800:17600 72/352 39/50 | Lr: 2.159e-03, 2.159e-02 | M:0.09508/C:0.08139 | [8, 1, 384, 384] | seg_BCE: 0.06453 seg_UAL_0.88932: 0.01686
+I:13820:17600 92/352 39/50 | Lr: 2.147e-03, 2.147e-02 | M:0.09652/C:0.08946 | [8, 1, 384, 384] | seg_BCE: 0.06393 seg_UAL_0.89044: 0.02553
+I:13840:17600 112/352 39/50 | Lr: 2.136e-03, 2.136e-02 | M:0.09841/C:0.10441 | [8, 1, 384, 384] | seg_BCE: 0.07500 seg_UAL_0.89155: 0.02941
+I:13860:17600 132/352 39/50 | Lr: 2.124e-03, 2.124e-02 | M:0.09808/C:0.14036 | [8, 1, 384, 384] | seg_BCE: 0.10727 seg_UAL_0.89266: 0.03309
+I:13880:17600 152/352 39/50 | Lr: 2.113e-03, 2.113e-02 | M:0.09895/C:0.08551 | [8, 1, 384, 384] | seg_BCE: 0.06023 seg_UAL_0.89376: 0.02528
+I:13900:17600 172/352 39/50 | Lr: 2.102e-03, 2.102e-02 | M:0.09941/C:0.14462 | [8, 1, 384, 384] | seg_BCE: 0.11205 seg_UAL_0.89486: 0.03256
+I:13920:17600 192/352 39/50 | Lr: 2.090e-03, 2.090e-02 | M:0.09962/C:0.09312 | [8, 1, 384, 384] | seg_BCE: 0.06816 seg_UAL_0.89595: 0.02496
+I:13940:17600 212/352 39/50 | Lr: 2.079e-03, 2.079e-02 | M:0.09917/C:0.11885 | [8, 1, 384, 384] | seg_BCE: 0.08933 seg_UAL_0.89704: 0.02952
+I:13960:17600 232/352 39/50 | Lr: 2.068e-03, 2.068e-02 | M:0.09898/C:0.07400 | [8, 1, 384, 384] | seg_BCE: 0.04822 seg_UAL_0.89812: 0.02578
+I:13980:17600 252/352 39/50 | Lr: 2.056e-03, 2.056e-02 | M:0.09886/C:0.13319 | [8, 1, 384, 384] | seg_BCE: 0.10338 seg_UAL_0.89920: 0.02981
+I:14000:17600 272/352 39/50 | Lr: 2.045e-03, 2.045e-02 | M:0.09908/C:0.11250 | [8, 1, 384, 384] | seg_BCE: 0.08477 seg_UAL_0.90027: 0.02773
+I:14020:17600 292/352 39/50 | Lr: 2.034e-03, 2.034e-02 | M:0.09946/C:0.10799 | [8, 1, 384, 384] | seg_BCE: 0.07239 seg_UAL_0.90134: 0.03561
+I:14040:17600 312/352 39/50 | Lr: 2.022e-03, 2.022e-02 | M:0.09950/C:0.13399 | [8, 1, 384, 384] | seg_BCE: 0.10165 seg_UAL_0.90240: 0.03234
+I:14060:17600 332/352 39/50 | Lr: 2.011e-03, 2.011e-02 | M:0.09933/C:0.12460 | [8, 1, 384, 384] | seg_BCE: 0.09609 seg_UAL_0.90346: 0.02851
+I:14079:17600 351/352 39/50 | Lr: 2.000e-03, 2.000e-02 | M:0.09916/C:0.08225 | [8, 1, 384, 384] | seg_BCE: 0.05739 seg_UAL_0.90446: 0.02487
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:14080:17600 0/352 40/50 | Lr: 1.999e-03, 1.999e-02 | M:0.13547/C:0.13547 | [8, 1, 384, 384] | seg_BCE: 0.11167 seg_UAL_0.90451: 0.02380
+I:14100:17600 20/352 40/50 | Lr: 1.988e-03, 1.988e-02 | M:0.11477/C:0.12817 | [8, 1, 384, 384] | seg_BCE: 0.09264 seg_UAL_0.90556: 0.03553
+I:14120:17600 40/352 40/50 | Lr: 1.977e-03, 1.977e-02 | M:0.11227/C:0.12020 | [8, 1, 384, 384] | seg_BCE: 0.08752 seg_UAL_0.90660: 0.03268
+I:14140:17600 60/352 40/50 | Lr: 1.965e-03, 1.965e-02 | M:0.10994/C:0.08514 | [8, 1, 384, 384] | seg_BCE: 0.06644 seg_UAL_0.90763: 0.01869
+I:14160:17600 80/352 40/50 | Lr: 1.954e-03, 1.954e-02 | M:0.10776/C:0.11198 | [8, 1, 384, 384] | seg_BCE: 0.08592 seg_UAL_0.90866: 0.02606
+I:14180:17600 100/352 40/50 | Lr: 1.943e-03, 1.943e-02 | M:0.10569/C:0.07785 | [8, 1, 384, 384] | seg_BCE: 0.05273 seg_UAL_0.90969: 0.02512
+I:14200:17600 120/352 40/50 | Lr: 1.931e-03, 1.931e-02 | M:0.10337/C:0.10225 | [8, 1, 384, 384] | seg_BCE: 0.07805 seg_UAL_0.91071: 0.02420
+I:14220:17600 140/352 40/50 | Lr: 1.920e-03, 1.920e-02 | M:0.10129/C:0.12068 | [8, 1, 384, 384] | seg_BCE: 0.09279 seg_UAL_0.91173: 0.02789
+I:14240:17600 160/352 40/50 | Lr: 1.909e-03, 1.909e-02 | M:0.09966/C:0.08875 | [8, 1, 384, 384] | seg_BCE: 0.06428 seg_UAL_0.91274: 0.02447
+I:14260:17600 180/352 40/50 | Lr: 1.897e-03, 1.897e-02 | M:0.09810/C:0.08201 | [8, 1, 384, 384] | seg_BCE: 0.05894 seg_UAL_0.91374: 0.02307
+I:14280:17600 200/352 40/50 | Lr: 1.886e-03, 1.886e-02 | M:0.09775/C:0.10488 | [8, 1, 384, 384] | seg_BCE: 0.07963 seg_UAL_0.91474: 0.02525
+I:14300:17600 220/352 40/50 | Lr: 1.874e-03, 1.874e-02 | M:0.09790/C:0.07606 | [8, 1, 384, 384] | seg_BCE: 0.05686 seg_UAL_0.91573: 0.01920
+I:14320:17600 240/352 40/50 | Lr: 1.863e-03, 1.863e-02 | M:0.09746/C:0.06977 | [8, 1, 384, 384] | seg_BCE: 0.04774 seg_UAL_0.91672: 0.02203
+I:14340:17600 260/352 40/50 | Lr: 1.852e-03, 1.852e-02 | M:0.09693/C:0.07078 | [8, 1, 384, 384] | seg_BCE: 0.04800 seg_UAL_0.91771: 0.02278
+I:14360:17600 280/352 40/50 | Lr: 1.840e-03, 1.840e-02 | M:0.09703/C:0.13606 | [8, 1, 384, 384] | seg_BCE: 0.10417 seg_UAL_0.91869: 0.03189
+I:14380:17600 300/352 40/50 | Lr: 1.829e-03, 1.829e-02 | M:0.09729/C:0.06398 | [8, 1, 384, 384] | seg_BCE: 0.04123 seg_UAL_0.91966: 0.02276
+I:14400:17600 320/352 40/50 | Lr: 1.818e-03, 1.818e-02 | M:0.09709/C:0.15555 | [8, 1, 384, 384] | seg_BCE: 0.12417 seg_UAL_0.92063: 0.03138
+I:14420:17600 340/352 40/50 | Lr: 1.806e-03, 1.806e-02 | M:0.09691/C:0.08181 | [8, 1, 384, 384] | seg_BCE: 0.06001 seg_UAL_0.92159: 0.02180
+I:14431:17600 351/352 40/50 | Lr: 1.800e-03, 1.800e-02 | M:0.09713/C:0.12069 | [8, 1, 384, 384] | seg_BCE: 0.08707 seg_UAL_0.92212: 0.03362
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:14440:17600 8/352 41/50 | Lr: 1.795e-03, 1.795e-02 | M:0.09208/C:0.11490 | [8, 1, 384, 384] | seg_BCE: 0.08312 seg_UAL_0.92255: 0.03178
+I:14460:17600 28/352 41/50 | Lr: 1.784e-03, 1.784e-02 | M:0.08858/C:0.11782 | [8, 1, 384, 384] | seg_BCE: 0.09332 seg_UAL_0.92350: 0.02450
+I:14480:17600 48/352 41/50 | Lr: 1.772e-03, 1.772e-02 | M:0.08908/C:0.09851 | [8, 1, 384, 384] | seg_BCE: 0.07404 seg_UAL_0.92444: 0.02446
+I:14500:17600 68/352 41/50 | Lr: 1.761e-03, 1.761e-02 | M:0.08912/C:0.07230 | [8, 1, 384, 384] | seg_BCE: 0.05177 seg_UAL_0.92538: 0.02053
+I:14520:17600 88/352 41/50 | Lr: 1.749e-03, 1.749e-02 | M:0.09307/C:0.09092 | [8, 1, 384, 384] | seg_BCE: 0.06402 seg_UAL_0.92632: 0.02690
+I:14540:17600 108/352 41/50 | Lr: 1.738e-03, 1.738e-02 | M:0.09154/C:0.07573 | [8, 1, 384, 384] | seg_BCE: 0.05532 seg_UAL_0.92725: 0.02041
+I:14560:17600 128/352 41/50 | Lr: 1.727e-03, 1.727e-02 | M:0.09103/C:0.07285 | [8, 1, 384, 384] | seg_BCE: 0.05074 seg_UAL_0.92817: 0.02211
+I:14580:17600 148/352 41/50 | Lr: 1.715e-03, 1.715e-02 | M:0.09111/C:0.05436 | [8, 1, 384, 384] | seg_BCE: 0.03505 seg_UAL_0.92909: 0.01931
+I:14600:17600 168/352 41/50 | Lr: 1.704e-03, 1.704e-02 | M:0.09089/C:0.08951 | [8, 1, 384, 384] | seg_BCE: 0.06302 seg_UAL_0.93001: 0.02648
+I:14620:17600 188/352 41/50 | Lr: 1.693e-03, 1.693e-02 | M:0.09076/C:0.11554 | [8, 1, 384, 384] | seg_BCE: 0.08424 seg_UAL_0.93092: 0.03130
+I:14640:17600 208/352 41/50 | Lr: 1.681e-03, 1.681e-02 | M:0.09041/C:0.05267 | [8, 1, 384, 384] | seg_BCE: 0.03760 seg_UAL_0.93182: 0.01507
+I:14660:17600 228/352 41/50 | Lr: 1.670e-03, 1.670e-02 | M:0.09035/C:0.06382 | [8, 1, 384, 384] | seg_BCE: 0.04589 seg_UAL_0.93271: 0.01793
+I:14680:17600 248/352 41/50 | Lr: 1.659e-03, 1.659e-02 | M:0.09061/C:0.10921 | [8, 1, 384, 384] | seg_BCE: 0.08149 seg_UAL_0.93361: 0.02772
+I:14700:17600 268/352 41/50 | Lr: 1.647e-03, 1.647e-02 | M:0.09079/C:0.10226 | [8, 1, 384, 384] | seg_BCE: 0.07595 seg_UAL_0.93449: 0.02631
+I:14720:17600 288/352 41/50 | Lr: 1.636e-03, 1.636e-02 | M:0.09176/C:0.10744 | [8, 1, 384, 384] | seg_BCE: 0.08446 seg_UAL_0.93537: 0.02298
+I:14740:17600 308/352 41/50 | Lr: 1.624e-03, 1.624e-02 | M:0.09258/C:0.13361 | [8, 1, 384, 384] | seg_BCE: 0.10542 seg_UAL_0.93625: 0.02820
+I:14760:17600 328/352 41/50 | Lr: 1.613e-03, 1.613e-02 | M:0.09259/C:0.05273 | [8, 1, 384, 384] | seg_BCE: 0.03536 seg_UAL_0.93712: 0.01737
+I:14780:17600 348/352 41/50 | Lr: 1.602e-03, 1.602e-02 | M:0.09295/C:0.13780 | [8, 1, 384, 384] | seg_BCE: 0.10858 seg_UAL_0.93798: 0.02922
+I:14783:17600 351/352 41/50 | Lr: 1.600e-03, 1.600e-02 | M:0.09282/C:0.05294 | [8, 1, 384, 384] | seg_BCE: 0.03567 seg_UAL_0.93811: 0.01727
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:14800:17600 16/352 42/50 | Lr: 1.590e-03, 1.590e-02 | M:0.08999/C:0.04430 | [8, 1, 384, 384] | seg_BCE: 0.02852 seg_UAL_0.93884: 0.01578
+I:14820:17600 36/352 42/50 | Lr: 1.579e-03, 1.579e-02 | M:0.10348/C:0.09801 | [8, 1, 384, 384] | seg_BCE: 0.06963 seg_UAL_0.93969: 0.02839
+I:14840:17600 56/352 42/50 | Lr: 1.568e-03, 1.568e-02 | M:0.10175/C:0.05588 | [8, 1, 384, 384] | seg_BCE: 0.03971 seg_UAL_0.94054: 0.01617
+I:14860:17600 76/352 42/50 | Lr: 1.556e-03, 1.556e-02 | M:0.09994/C:0.12342 | [8, 1, 384, 384] | seg_BCE: 0.09490 seg_UAL_0.94138: 0.02851
+I:14880:17600 96/352 42/50 | Lr: 1.545e-03, 1.545e-02 | M:0.09742/C:0.11235 | [8, 1, 384, 384] | seg_BCE: 0.08204 seg_UAL_0.94222: 0.03030
+I:14900:17600 116/352 42/50 | Lr: 1.534e-03, 1.534e-02 | M:0.09591/C:0.07919 | [8, 1, 384, 384] | seg_BCE: 0.05950 seg_UAL_0.94305: 0.01969
+I:14920:17600 136/352 42/50 | Lr: 1.522e-03, 1.522e-02 | M:0.09660/C:0.19925 | [8, 1, 384, 384] | seg_BCE: 0.15544 seg_UAL_0.94387: 0.04381
+I:14940:17600 156/352 42/50 | Lr: 1.511e-03, 1.511e-02 | M:0.09709/C:0.09141 | [8, 1, 384, 384] | seg_BCE: 0.06192 seg_UAL_0.94469: 0.02949
+I:14960:17600 176/352 42/50 | Lr: 1.499e-03, 1.499e-02 | M:0.09713/C:0.07233 | [8, 1, 384, 384] | seg_BCE: 0.05126 seg_UAL_0.94550: 0.02107
+I:14980:17600 196/352 42/50 | Lr: 1.488e-03, 1.488e-02 | M:0.09647/C:0.06394 | [8, 1, 384, 384] | seg_BCE: 0.04246 seg_UAL_0.94631: 0.02148
+I:15000:17600 216/352 42/50 | Lr: 1.477e-03, 1.477e-02 | M:0.09617/C:0.09152 | [8, 1, 384, 384] | seg_BCE: 0.06721 seg_UAL_0.94711: 0.02431
+I:15020:17600 236/352 42/50 | Lr: 1.465e-03, 1.465e-02 | M:0.09526/C:0.10370 | [8, 1, 384, 384] | seg_BCE: 0.07891 seg_UAL_0.94791: 0.02478
+I:15040:17600 256/352 42/50 | Lr: 1.454e-03, 1.454e-02 | M:0.09497/C:0.16592 | [8, 1, 384, 384] | seg_BCE: 0.13963 seg_UAL_0.94870: 0.02628
+I:15060:17600 276/352 42/50 | Lr: 1.443e-03, 1.443e-02 | M:0.09444/C:0.05349 | [8, 1, 384, 384] | seg_BCE: 0.03787 seg_UAL_0.94948: 0.01562
+I:15080:17600 296/352 42/50 | Lr: 1.431e-03, 1.431e-02 | M:0.09457/C:0.12625 | [8, 1, 384, 384] | seg_BCE: 0.09740 seg_UAL_0.95026: 0.02884
+I:15100:17600 316/352 42/50 | Lr: 1.420e-03, 1.420e-02 | M:0.09463/C:0.06289 | [8, 1, 384, 384] | seg_BCE: 0.04348 seg_UAL_0.95104: 0.01941
+I:15120:17600 336/352 42/50 | Lr: 1.409e-03, 1.409e-02 | M:0.09471/C:0.11232 | [8, 1, 384, 384] | seg_BCE: 0.08530 seg_UAL_0.95180: 0.02702
+I:15135:17600 351/352 42/50 | Lr: 1.400e-03, 1.400e-02 | M:0.09504/C:0.15183 | [8, 1, 384, 384] | seg_BCE: 0.10916 seg_UAL_0.95238: 0.04268
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:15140:17600 4/352 43/50 | Lr: 1.397e-03, 1.397e-02 | M:0.08960/C:0.09746 | [8, 1, 384, 384] | seg_BCE: 0.06986 seg_UAL_0.95257: 0.02760
+I:15160:17600 24/352 43/50 | Lr: 1.386e-03, 1.386e-02 | M:0.08726/C:0.06055 | [8, 1, 384, 384] | seg_BCE: 0.04298 seg_UAL_0.95332: 0.01757
+I:15180:17600 44/352 43/50 | Lr: 1.374e-03, 1.374e-02 | M:0.08785/C:0.08193 | [8, 1, 384, 384] | seg_BCE: 0.06193 seg_UAL_0.95407: 0.02000
+I:15200:17600 64/352 43/50 | Lr: 1.363e-03, 1.363e-02 | M:0.08815/C:0.07505 | [8, 1, 384, 384] | seg_BCE: 0.05260 seg_UAL_0.95482: 0.02245
+I:15220:17600 84/352 43/50 | Lr: 1.352e-03, 1.352e-02 | M:0.08788/C:0.13648 | [8, 1, 384, 384] | seg_BCE: 0.11338 seg_UAL_0.95555: 0.02310
+I:15240:17600 104/352 43/50 | Lr: 1.340e-03, 1.340e-02 | M:0.08594/C:0.08206 | [8, 1, 384, 384] | seg_BCE: 0.05886 seg_UAL_0.95629: 0.02320
+I:15260:17600 124/352 43/50 | Lr: 1.329e-03, 1.329e-02 | M:0.08495/C:0.10207 | [8, 1, 384, 384] | seg_BCE: 0.07971 seg_UAL_0.95701: 0.02237
+I:15280:17600 144/352 43/50 | Lr: 1.318e-03, 1.318e-02 | M:0.08600/C:0.05940 | [8, 1, 384, 384] | seg_BCE: 0.04181 seg_UAL_0.95774: 0.01759
+I:15300:17600 164/352 43/50 | Lr: 1.306e-03, 1.306e-02 | M:0.08684/C:0.12194 | [8, 1, 384, 384] | seg_BCE: 0.08907 seg_UAL_0.95845: 0.03288
+I:15320:17600 184/352 43/50 | Lr: 1.295e-03, 1.295e-02 | M:0.08807/C:0.11457 | [8, 1, 384, 384] | seg_BCE: 0.08547 seg_UAL_0.95916: 0.02910
+I:15340:17600 204/352 43/50 | Lr: 1.284e-03, 1.284e-02 | M:0.08895/C:0.16895 | [8, 1, 384, 384] | seg_BCE: 0.14558 seg_UAL_0.95986: 0.02337
+I:15360:17600 224/352 43/50 | Lr: 1.272e-03, 1.272e-02 | M:0.08854/C:0.07686 | [8, 1, 384, 384] | seg_BCE: 0.05752 seg_UAL_0.96056: 0.01934
+I:15380:17600 244/352 43/50 | Lr: 1.261e-03, 1.261e-02 | M:0.08886/C:0.13511 | [8, 1, 384, 384] | seg_BCE: 0.10228 seg_UAL_0.96125: 0.03282
+I:15400:17600 264/352 43/50 | Lr: 1.249e-03, 1.249e-02 | M:0.08906/C:0.08518 | [8, 1, 384, 384] | seg_BCE: 0.06403 seg_UAL_0.96194: 0.02115
+I:15420:17600 284/352 43/50 | Lr: 1.238e-03, 1.238e-02 | M:0.09014/C:0.07723 | [8, 1, 384, 384] | seg_BCE: 0.05709 seg_UAL_0.96262: 0.02014
+I:15440:17600 304/352 43/50 | Lr: 1.227e-03, 1.227e-02 | M:0.08967/C:0.09868 | [8, 1, 384, 384] | seg_BCE: 0.07911 seg_UAL_0.96329: 0.01957
+I:15460:17600 324/352 43/50 | Lr: 1.215e-03, 1.215e-02 | M:0.08933/C:0.06644 | [8, 1, 384, 384] | seg_BCE: 0.04376 seg_UAL_0.96396: 0.02268
+I:15480:17600 344/352 43/50 | Lr: 1.204e-03, 1.204e-02 | M:0.08897/C:0.09224 | [8, 1, 384, 384] | seg_BCE: 0.07150 seg_UAL_0.96462: 0.02074
+I:15487:17600 351/352 43/50 | Lr: 1.200e-03, 1.200e-02 | M:0.08885/C:0.05394 | [8, 1, 384, 384] | seg_BCE: 0.03539 seg_UAL_0.96486: 0.01855
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:15500:17600 12/352 44/50 | Lr: 1.193e-03, 1.193e-02 | M:0.08691/C:0.07048 | [8, 1, 384, 384] | seg_BCE: 0.05106 seg_UAL_0.96528: 0.01941
+I:15520:17600 32/352 44/50 | Lr: 1.181e-03, 1.181e-02 | M:0.08690/C:0.16502 | [8, 1, 384, 384] | seg_BCE: 0.13153 seg_UAL_0.96593: 0.03349
+I:15540:17600 52/352 44/50 | Lr: 1.170e-03, 1.170e-02 | M:0.09171/C:0.08735 | [8, 1, 384, 384] | seg_BCE: 0.06254 seg_UAL_0.96658: 0.02481
+I:15560:17600 72/352 44/50 | Lr: 1.159e-03, 1.159e-02 | M:0.09050/C:0.08485 | [8, 1, 384, 384] | seg_BCE: 0.06211 seg_UAL_0.96722: 0.02274
+I:15580:17600 92/352 44/50 | Lr: 1.147e-03, 1.147e-02 | M:0.08916/C:0.05669 | [8, 1, 384, 384] | seg_BCE: 0.03640 seg_UAL_0.96785: 0.02028
+I:15600:17600 112/352 44/50 | Lr: 1.136e-03, 1.136e-02 | M:0.08775/C:0.09361 | [8, 1, 384, 384] | seg_BCE: 0.06968 seg_UAL_0.96847: 0.02393
+I:15620:17600 132/352 44/50 | Lr: 1.124e-03, 1.124e-02 | M:0.08716/C:0.06362 | [8, 1, 384, 384] | seg_BCE: 0.04284 seg_UAL_0.96910: 0.02078
+I:15640:17600 152/352 44/50 | Lr: 1.113e-03, 1.113e-02 | M:0.08759/C:0.11989 | [8, 1, 384, 384] | seg_BCE: 0.08434 seg_UAL_0.96971: 0.03556
+I:15660:17600 172/352 44/50 | Lr: 1.102e-03, 1.102e-02 | M:0.08685/C:0.08008 | [8, 1, 384, 384] | seg_BCE: 0.06285 seg_UAL_0.97032: 0.01723
+I:15680:17600 192/352 44/50 | Lr: 1.090e-03, 1.090e-02 | M:0.08669/C:0.08488 | [8, 1, 384, 384] | seg_BCE: 0.06230 seg_UAL_0.97092: 0.02259
+I:15700:17600 212/352 44/50 | Lr: 1.079e-03, 1.079e-02 | M:0.08715/C:0.06133 | [8, 1, 384, 384] | seg_BCE: 0.04326 seg_UAL_0.97152: 0.01807
+I:15720:17600 232/352 44/50 | Lr: 1.068e-03, 1.068e-02 | M:0.08700/C:0.05075 | [8, 1, 384, 384] | seg_BCE: 0.03491 seg_UAL_0.97211: 0.01584
+I:15740:17600 252/352 44/50 | Lr: 1.056e-03, 1.056e-02 | M:0.08669/C:0.04005 | [8, 1, 384, 384] | seg_BCE: 0.02719 seg_UAL_0.97269: 0.01286
+I:15760:17600 272/352 44/50 | Lr: 1.045e-03, 1.045e-02 | M:0.08674/C:0.09891 | [8, 1, 384, 384] | seg_BCE: 0.07532 seg_UAL_0.97327: 0.02359
+I:15780:17600 292/352 44/50 | Lr: 1.034e-03, 1.034e-02 | M:0.08658/C:0.07140 | [8, 1, 384, 384] | seg_BCE: 0.05477 seg_UAL_0.97385: 0.01662
+I:15800:17600 312/352 44/50 | Lr: 1.022e-03, 1.022e-02 | M:0.08597/C:0.07522 | [8, 1, 384, 384] | seg_BCE: 0.05837 seg_UAL_0.97441: 0.01684
+I:15820:17600 332/352 44/50 | Lr: 1.011e-03, 1.011e-02 | M:0.08584/C:0.07538 | [8, 1, 384, 384] | seg_BCE: 0.05585 seg_UAL_0.97497: 0.01953
+I:15839:17600 351/352 44/50 | Lr: 1.000e-03, 1.000e-02 | M:0.08620/C:0.11972 | [8, 1, 384, 384] | seg_BCE: 0.09297 seg_UAL_0.97550: 0.02675
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:15840:17600 0/352 45/50 | Lr: 9.994e-04, 9.994e-03 | M:0.07590/C:0.07590 | [8, 1, 384, 384] | seg_BCE: 0.05358 seg_UAL_0.97553: 0.02232
+I:15860:17600 20/352 45/50 | Lr: 9.881e-04, 9.881e-03 | M:0.08381/C:0.05865 | [8, 1, 384, 384] | seg_BCE: 0.03983 seg_UAL_0.97608: 0.01881
+I:15880:17600 40/352 45/50 | Lr: 9.767e-04, 9.767e-03 | M:0.08691/C:0.07634 | [8, 1, 384, 384] | seg_BCE: 0.04986 seg_UAL_0.97662: 0.02647
+I:15900:17600 60/352 45/50 | Lr: 9.653e-04, 9.653e-03 | M:0.08348/C:0.06276 | [8, 1, 384, 384] | seg_BCE: 0.04274 seg_UAL_0.97716: 0.02002
+I:15920:17600 80/352 45/50 | Lr: 9.540e-04, 9.540e-03 | M:0.08296/C:0.10152 | [8, 1, 384, 384] | seg_BCE: 0.08070 seg_UAL_0.97769: 0.02082
+I:15940:17600 100/352 45/50 | Lr: 9.426e-04, 9.426e-03 | M:0.08238/C:0.07024 | [8, 1, 384, 384] | seg_BCE: 0.05159 seg_UAL_0.97821: 0.01864
+I:15960:17600 120/352 45/50 | Lr: 9.313e-04, 9.313e-03 | M:0.08363/C:0.09439 | [8, 1, 384, 384] | seg_BCE: 0.07426 seg_UAL_0.97873: 0.02013
+I:15980:17600 140/352 45/50 | Lr: 9.199e-04, 9.199e-03 | M:0.08492/C:0.09809 | [8, 1, 384, 384] | seg_BCE: 0.07505 seg_UAL_0.97924: 0.02303
+I:16000:17600 160/352 45/50 | Lr: 9.085e-04, 9.085e-03 | M:0.08445/C:0.11728 | [8, 1, 384, 384] | seg_BCE: 0.08610 seg_UAL_0.97975: 0.03117
+I:16020:17600 180/352 45/50 | Lr: 8.972e-04, 8.972e-03 | M:0.08368/C:0.11853 | [8, 1, 384, 384] | seg_BCE: 0.09204 seg_UAL_0.98025: 0.02649
+I:16040:17600 200/352 45/50 | Lr: 8.858e-04, 8.858e-03 | M:0.08306/C:0.08474 | [8, 1, 384, 384] | seg_BCE: 0.05972 seg_UAL_0.98074: 0.02502
+I:16060:17600 220/352 45/50 | Lr: 8.744e-04, 8.744e-03 | M:0.08238/C:0.09597 | [8, 1, 384, 384] | seg_BCE: 0.07643 seg_UAL_0.98123: 0.01954
+I:16080:17600 240/352 45/50 | Lr: 8.631e-04, 8.631e-03 | M:0.08224/C:0.11754 | [8, 1, 384, 384] | seg_BCE: 0.09179 seg_UAL_0.98171: 0.02576
+I:16100:17600 260/352 45/50 | Lr: 8.517e-04, 8.517e-03 | M:0.08219/C:0.11066 | [8, 1, 384, 384] | seg_BCE: 0.08320 seg_UAL_0.98218: 0.02746
+I:16120:17600 280/352 45/50 | Lr: 8.403e-04, 8.403e-03 | M:0.08191/C:0.11700 | [8, 1, 384, 384] | seg_BCE: 0.09039 seg_UAL_0.98265: 0.02661
+I:16140:17600 300/352 45/50 | Lr: 8.290e-04, 8.290e-03 | M:0.08163/C:0.09234 | [8, 1, 384, 384] | seg_BCE: 0.06916 seg_UAL_0.98312: 0.02318
+I:16160:17600 320/352 45/50 | Lr: 8.176e-04, 8.176e-03 | M:0.08171/C:0.13221 | [8, 1, 384, 384] | seg_BCE: 0.10145 seg_UAL_0.98357: 0.03076
+I:16180:17600 340/352 45/50 | Lr: 8.062e-04, 8.062e-03 | M:0.08163/C:0.10596 | [8, 1, 384, 384] | seg_BCE: 0.08063 seg_UAL_0.98402: 0.02533
+I:16191:17600 351/352 45/50 | Lr: 8.000e-04, 8.000e-03 | M:0.08168/C:0.05571 | [8, 1, 384, 384] | seg_BCE: 0.03654 seg_UAL_0.98427: 0.01917
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:16200:17600 8/352 46/50 | Lr: 7.949e-04, 7.949e-03 | M:0.08345/C:0.10198 | [8, 1, 384, 384] | seg_BCE: 0.07093 seg_UAL_0.98447: 0.03105
+I:16220:17600 28/352 46/50 | Lr: 7.835e-04, 7.835e-03 | M:0.07532/C:0.06673 | [8, 1, 384, 384] | seg_BCE: 0.04937 seg_UAL_0.98491: 0.01736
+I:16240:17600 48/352 46/50 | Lr: 7.722e-04, 7.722e-03 | M:0.07709/C:0.06925 | [8, 1, 384, 384] | seg_BCE: 0.04888 seg_UAL_0.98534: 0.02037
+I:16260:17600 68/352 46/50 | Lr: 7.608e-04, 7.608e-03 | M:0.07711/C:0.10644 | [8, 1, 384, 384] | seg_BCE: 0.08165 seg_UAL_0.98577: 0.02479
+I:16280:17600 88/352 46/50 | Lr: 7.494e-04, 7.494e-03 | M:0.07691/C:0.09174 | [8, 1, 384, 384] | seg_BCE: 0.07142 seg_UAL_0.98618: 0.02032
+I:16300:17600 108/352 46/50 | Lr: 7.381e-04, 7.381e-03 | M:0.07775/C:0.08329 | [8, 1, 384, 384] | seg_BCE: 0.06417 seg_UAL_0.98660: 0.01912
+I:16320:17600 128/352 46/50 | Lr: 7.267e-04, 7.267e-03 | M:0.07888/C:0.09237 | [8, 1, 384, 384] | seg_BCE: 0.07154 seg_UAL_0.98701: 0.02083
+I:16340:17600 148/352 46/50 | Lr: 7.153e-04, 7.153e-03 | M:0.07836/C:0.07549 | [8, 1, 384, 384] | seg_BCE: 0.05743 seg_UAL_0.98741: 0.01806
+I:16360:17600 168/352 46/50 | Lr: 7.040e-04, 7.040e-03 | M:0.07785/C:0.07538 | [8, 1, 384, 384] | seg_BCE: 0.05604 seg_UAL_0.98780: 0.01933
+I:16380:17600 188/352 46/50 | Lr: 6.926e-04, 6.926e-03 | M:0.07750/C:0.05101 | [8, 1, 384, 384] | seg_BCE: 0.03505 seg_UAL_0.98819: 0.01597
+I:16400:17600 208/352 46/50 | Lr: 6.812e-04, 6.812e-03 | M:0.07825/C:0.06054 | [8, 1, 384, 384] | seg_BCE: 0.04283 seg_UAL_0.98857: 0.01770
+I:16420:17600 228/352 46/50 | Lr: 6.699e-04, 6.699e-03 | M:0.07808/C:0.09340 | [8, 1, 384, 384] | seg_BCE: 0.07157 seg_UAL_0.98895: 0.02183
+I:16440:17600 248/352 46/50 | Lr: 6.585e-04, 6.585e-03 | M:0.07779/C:0.07109 | [8, 1, 384, 384] | seg_BCE: 0.04856 seg_UAL_0.98932: 0.02254
+I:16460:17600 268/352 46/50 | Lr: 6.472e-04, 6.472e-03 | M:0.07772/C:0.07938 | [8, 1, 384, 384] | seg_BCE: 0.05997 seg_UAL_0.98968: 0.01941
+I:16480:17600 288/352 46/50 | Lr: 6.358e-04, 6.358e-03 | M:0.07775/C:0.08345 | [8, 1, 384, 384] | seg_BCE: 0.06107 seg_UAL_0.99004: 0.02239
+I:16500:17600 308/352 46/50 | Lr: 6.244e-04, 6.244e-03 | M:0.07825/C:0.10310 | [8, 1, 384, 384] | seg_BCE: 0.08006 seg_UAL_0.99039: 0.02304
+I:16520:17600 328/352 46/50 | Lr: 6.131e-04, 6.131e-03 | M:0.07843/C:0.05180 | [8, 1, 384, 384] | seg_BCE: 0.03730 seg_UAL_0.99074: 0.01449
+I:16540:17600 348/352 46/50 | Lr: 6.017e-04, 6.017e-03 | M:0.07858/C:0.06233 | [8, 1, 384, 384] | seg_BCE: 0.04340 seg_UAL_0.99108: 0.01893
+I:16543:17600 351/352 46/50 | Lr: 6.000e-04, 6.000e-03 | M:0.07871/C:0.09227 | [8, 1, 384, 384] | seg_BCE: 0.06748 seg_UAL_0.99113: 0.02479
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:16560:17600 16/352 47/50 | Lr: 5.903e-04, 5.903e-03 | M:0.08861/C:0.09893 | [8, 1, 384, 384] | seg_BCE: 0.07290 seg_UAL_0.99141: 0.02603
+I:16580:17600 36/352 47/50 | Lr: 5.790e-04, 5.790e-03 | M:0.08133/C:0.11367 | [8, 1, 384, 384] | seg_BCE: 0.08604 seg_UAL_0.99174: 0.02763
+I:16600:17600 56/352 47/50 | Lr: 5.676e-04, 5.676e-03 | M:0.07943/C:0.06563 | [8, 1, 384, 384] | seg_BCE: 0.04803 seg_UAL_0.99206: 0.01759
+I:16620:17600 76/352 47/50 | Lr: 5.563e-04, 5.563e-03 | M:0.07721/C:0.06002 | [8, 1, 384, 384] | seg_BCE: 0.04131 seg_UAL_0.99237: 0.01871
+I:16640:17600 96/352 47/50 | Lr: 5.449e-04, 5.449e-03 | M:0.07772/C:0.05391 | [8, 1, 384, 384] | seg_BCE: 0.03826 seg_UAL_0.99268: 0.01564
+I:16660:17600 116/352 47/50 | Lr: 5.335e-04, 5.335e-03 | M:0.07843/C:0.10076 | [8, 1, 384, 384] | seg_BCE: 0.07582 seg_UAL_0.99298: 0.02494
+I:16680:17600 136/352 47/50 | Lr: 5.222e-04, 5.222e-03 | M:0.07783/C:0.06757 | [8, 1, 384, 384] | seg_BCE: 0.04912 seg_UAL_0.99327: 0.01845
+I:16700:17600 156/352 47/50 | Lr: 5.108e-04, 5.108e-03 | M:0.07823/C:0.08391 | [8, 1, 384, 384] | seg_BCE: 0.06627 seg_UAL_0.99356: 0.01764
+I:16720:17600 176/352 47/50 | Lr: 4.994e-04, 4.994e-03 | M:0.07772/C:0.09718 | [8, 1, 384, 384] | seg_BCE: 0.07411 seg_UAL_0.99384: 0.02307
+I:16740:17600 196/352 47/50 | Lr: 4.881e-04, 4.881e-03 | M:0.07710/C:0.05214 | [8, 1, 384, 384] | seg_BCE: 0.03601 seg_UAL_0.99412: 0.01613
+I:16760:17600 216/352 47/50 | Lr: 4.767e-04, 4.767e-03 | M:0.07655/C:0.08495 | [8, 1, 384, 384] | seg_BCE: 0.06529 seg_UAL_0.99439: 0.01966
+I:16780:17600 236/352 47/50 | Lr: 4.653e-04, 4.653e-03 | M:0.07606/C:0.05400 | [8, 1, 384, 384] | seg_BCE: 0.04054 seg_UAL_0.99465: 0.01346
+I:16800:17600 256/352 47/50 | Lr: 4.540e-04, 4.540e-03 | M:0.07644/C:0.06858 | [8, 1, 384, 384] | seg_BCE: 0.05023 seg_UAL_0.99491: 0.01835
+I:16820:17600 276/352 47/50 | Lr: 4.426e-04, 4.426e-03 | M:0.07633/C:0.08601 | [8, 1, 384, 384] | seg_BCE: 0.06884 seg_UAL_0.99516: 0.01717
+I:16840:17600 296/352 47/50 | Lr: 4.312e-04, 4.312e-03 | M:0.07595/C:0.09094 | [8, 1, 384, 384] | seg_BCE: 0.07185 seg_UAL_0.99541: 0.01909
+I:16860:17600 316/352 47/50 | Lr: 4.199e-04, 4.199e-03 | M:0.07570/C:0.08950 | [8, 1, 384, 384] | seg_BCE: 0.06876 seg_UAL_0.99564: 0.02075
+I:16880:17600 336/352 47/50 | Lr: 4.085e-04, 4.085e-03 | M:0.07608/C:0.14528 | [8, 1, 384, 384] | seg_BCE: 0.11064 seg_UAL_0.99588: 0.03464
+I:16895:17600 351/352 47/50 | Lr: 4.000e-04, 4.000e-03 | M:0.07658/C:0.10690 | [8, 1, 384, 384] | seg_BCE: 0.08234 seg_UAL_0.99605: 0.02456
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:16900:17600 4/352 48/50 | Lr: 3.972e-04, 3.972e-03 | M:0.07166/C:0.07325 | [8, 1, 384, 384] | seg_BCE: 0.05149 seg_UAL_0.99610: 0.02176
+I:16920:17600 24/352 48/50 | Lr: 3.858e-04, 3.858e-03 | M:0.07263/C:0.05273 | [8, 1, 384, 384] | seg_BCE: 0.03687 seg_UAL_0.99632: 0.01586
+I:16940:17600 44/352 48/50 | Lr: 3.744e-04, 3.744e-03 | M:0.06996/C:0.04132 | [8, 1, 384, 384] | seg_BCE: 0.02939 seg_UAL_0.99653: 0.01193
+I:16960:17600 64/352 48/50 | Lr: 3.631e-04, 3.631e-03 | M:0.07347/C:0.09104 | [8, 1, 384, 384] | seg_BCE: 0.06774 seg_UAL_0.99674: 0.02331
+I:16980:17600 84/352 48/50 | Lr: 3.517e-04, 3.517e-03 | M:0.07427/C:0.05159 | [8, 1, 384, 384] | seg_BCE: 0.03641 seg_UAL_0.99694: 0.01518
+I:17000:17600 104/352 48/50 | Lr: 3.403e-04, 3.403e-03 | M:0.07413/C:0.07927 | [8, 1, 384, 384] | seg_BCE: 0.06065 seg_UAL_0.99714: 0.01862
+I:17020:17600 124/352 48/50 | Lr: 3.290e-04, 3.290e-03 | M:0.07389/C:0.06230 | [8, 1, 384, 384] | seg_BCE: 0.04636 seg_UAL_0.99732: 0.01593
+I:17040:17600 144/352 48/50 | Lr: 3.176e-04, 3.176e-03 | M:0.07413/C:0.06186 | [8, 1, 384, 384] | seg_BCE: 0.04355 seg_UAL_0.99750: 0.01831
+I:17060:17600 164/352 48/50 | Lr: 3.063e-04, 3.063e-03 | M:0.07410/C:0.06269 | [8, 1, 384, 384] | seg_BCE: 0.04515 seg_UAL_0.99768: 0.01755
+I:17080:17600 184/352 48/50 | Lr: 2.949e-04, 2.949e-03 | M:0.07378/C:0.06033 | [8, 1, 384, 384] | seg_BCE: 0.04260 seg_UAL_0.99785: 0.01773
+I:17100:17600 204/352 48/50 | Lr: 2.835e-04, 2.835e-03 | M:0.07469/C:0.12338 | [8, 1, 384, 384] | seg_BCE: 0.09884 seg_UAL_0.99801: 0.02454
+I:17120:17600 224/352 48/50 | Lr: 2.722e-04, 2.722e-03 | M:0.07524/C:0.10996 | [8, 1, 384, 384] | seg_BCE: 0.08707 seg_UAL_0.99817: 0.02290
+I:17140:17600 244/352 48/50 | Lr: 2.608e-04, 2.608e-03 | M:0.07517/C:0.06159 | [8, 1, 384, 384] | seg_BCE: 0.04242 seg_UAL_0.99832: 0.01917
+I:17160:17600 264/352 48/50 | Lr: 2.494e-04, 2.494e-03 | M:0.07503/C:0.07971 | [8, 1, 384, 384] | seg_BCE: 0.05956 seg_UAL_0.99846: 0.02015
+I:17180:17600 284/352 48/50 | Lr: 2.381e-04, 2.381e-03 | M:0.07492/C:0.09384 | [8, 1, 384, 384] | seg_BCE: 0.07044 seg_UAL_0.99860: 0.02340
+I:17200:17600 304/352 48/50 | Lr: 2.267e-04, 2.267e-03 | M:0.07466/C:0.04309 | [8, 1, 384, 384] | seg_BCE: 0.03026 seg_UAL_0.99873: 0.01283
+I:17220:17600 324/352 48/50 | Lr: 2.153e-04, 2.153e-03 | M:0.07476/C:0.06553 | [8, 1, 384, 384] | seg_BCE: 0.05097 seg_UAL_0.99885: 0.01456
+I:17240:17600 344/352 48/50 | Lr: 2.040e-04, 2.040e-03 | M:0.07493/C:0.06501 | [8, 1, 384, 384] | seg_BCE: 0.04839 seg_UAL_0.99897: 0.01662
+I:17247:17600 351/352 48/50 | Lr: 2.000e-04, 2.000e-03 | M:0.07504/C:0.07030 | [8, 1, 384, 384] | seg_BCE: 0.05254 seg_UAL_0.99901: 0.01775
+Exp_Name: MFFN_BS8_LR0.05_E50_H384_W384_OPMsgd_OPGMfinetune_SCf3_AMP_INFOdemo
+I:17260:17600 12/352 49/50 | Lr: 1.926e-04, 1.926e-03 | M:0.06952/C:0.05675 | [8, 1, 384, 384] | seg_BCE: 0.04180 seg_UAL_0.99908: 0.01495
+I:17280:17600 32/352 49/50 | Lr: 1.812e-04, 1.812e-03 | M:0.07417/C:0.08577 | [8, 1, 384, 384] | seg_BCE: 0.06024 seg_UAL_0.99918: 0.02553
+I:17300:17600 52/352 49/50 | Lr: 1.699e-04, 1.699e-03 | M:0.07445/C:0.04081 | [8, 1, 384, 384] | seg_BCE: 0.02994 seg_UAL_0.99928: 0.01087
+I:17320:17600 72/352 49/50 | Lr: 1.585e-04, 1.585e-03 | M:0.07365/C:0.04594 | [8, 1, 384, 384] | seg_BCE: 0.03277 seg_UAL_0.99938: 0.01317
+I:17340:17600 92/352 49/50 | Lr: 1.472e-04, 1.472e-03 | M:0.07177/C:0.09639 | [8, 1, 384, 384] | seg_BCE: 0.07289 seg_UAL_0.99946: 0.02350
+I:17360:17600 112/352 49/50 | Lr: 1.358e-04, 1.358e-03 | M:0.07191/C:0.06084 | [8, 1, 384, 384] | seg_BCE: 0.04426 seg_UAL_0.99954: 0.01658
+I:17380:17600 132/352 49/50 | Lr: 1.244e-04, 1.244e-03 | M:0.07150/C:0.04140 | [8, 1, 384, 384] | seg_BCE: 0.02811 seg_UAL_0.99961: 0.01329
+I:17400:17600 152/352 49/50 | Lr: 1.131e-04, 1.131e-03 | M:0.07158/C:0.06089 | [8, 1, 384, 384] | seg_BCE: 0.04411 seg_UAL_0.99968: 0.01678
+I:17420:17600 172/352 49/50 | Lr: 1.017e-04, 1.017e-03 | M:0.07175/C:0.06835 | [8, 1, 384, 384] | seg_BCE: 0.05272 seg_UAL_0.99974: 0.01564
+I:17440:17600 192/352 49/50 | Lr: 9.034e-05, 9.034e-04 | M:0.07130/C:0.06440 | [8, 1, 384, 384] | seg_BCE: 0.04674 seg_UAL_0.99980: 0.01766
+I:17460:17600 212/352 49/50 | Lr: 7.898e-05, 7.898e-04 | M:0.07118/C:0.06758 | [8, 1, 384, 384] | seg_BCE: 0.04986 seg_UAL_0.99984: 0.01772
+I:17480:17600 232/352 49/50 | Lr: 6.761e-05, 6.761e-04 | M:0.07124/C:0.04756 | [8, 1, 384, 384] | seg_BCE: 0.03070 seg_UAL_0.99989: 0.01686
+I:17500:17600 252/352 49/50 | Lr: 5.625e-05, 5.625e-04 | M:0.07146/C:0.07233 | [8, 1, 384, 384] | seg_BCE: 0.05219 seg_UAL_0.99992: 0.02014
+I:17520:17600 272/352 49/50 | Lr: 4.489e-05, 4.489e-04 | M:0.07211/C:0.07668 | [8, 1, 384, 384] | seg_BCE: 0.05928 seg_UAL_0.99995: 0.01739
+I:17540:17600 292/352 49/50 | Lr: 3.352e-05, 3.352e-04 | M:0.07243/C:0.09526 | [8, 1, 384, 384] | seg_BCE: 0.07064 seg_UAL_0.99997: 0.02462
+I:17560:17600 312/352 49/50 | Lr: 2.216e-05, 2.216e-04 | M:0.07249/C:0.06420 | [8, 1, 384, 384] | seg_BCE: 0.04716 seg_UAL_0.99999: 0.01704
+I:17580:17600 332/352 49/50 | Lr: 1.080e-05, 1.080e-04 | M:0.07232/C:0.07743 | [8, 1, 384, 384] | seg_BCE: 0.05916 seg_UAL_1.00000: 0.01828
+I:17599:17600 351/352 49/50 | Lr: 0.000e+00, 0.000e+00 | M:0.07219/C:0.06725 | [8, 1, 384, 384] | seg_BCE: 0.04939 seg_UAL_1.00000: 0.01787
+End training...
